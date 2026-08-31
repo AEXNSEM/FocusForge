@@ -21,12 +21,13 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Setup Gradle
+      - name: Setup Gradle (No Cache)
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.2'
+          cache-disabled: true
 
-      - name: Build with Gradle
+      - name: Build Debug APK
         run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
