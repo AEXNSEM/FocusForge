@@ -66,10 +66,21 @@ class MainActivity : ComponentActivity() {
                     if (blockedApp != null) {
                         TwoPhaseLockoutScreen(
                             blockedApp = blockedApp,
-                            onComplete = { grantWindowMinutes ->
+                            onComplete = { grantWindowMinutes, shouldLaunchTarget ->
                                 grantAccessPass(blockedApp, grantWindowMinutes)
                                 currentBlockedApp.value = null
-                                moveTaskToBack(true)
+
+                                if (shouldLaunchTarget) {
+                                    val launchIntent = packageManager.getLaunchIntentForPackage(blockedApp)
+                                    if (launchIntent != null) {
+                                        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        startActivity(launchIntent)
+                                    } else {
+                                        moveTaskToBack(true)
+                                    }
+                                } else {
+                                    moveTaskToBack(true)
+                                }
                             }
                         )
                     } else {
@@ -120,17 +131,13 @@ fun loadLearningModules(context: Context): List<LearningModule> {
     } catch (e: Exception) {
         modules.add(
             LearningModule(
-                id = "sys_01",
-                topic = "Systems Thinking",
-                title = "Feedback Loops & System Delays",
-                content = "Complex adaptive systems are governed by positive and negative feedback loops. When a significant time delay exists between an action and its feedback, decision-makers overcompensate, creating severe instability.",
-                question = "What primary problem arises from delays in feedback loops?",
-                options = listOf(
-                    "Instant equilibrium",
-                    "Overcorrection and systemic oscillation",
-                    "Total system shutdown"
-                ),
-                correctIndex = 1
+                id = "dop_01",
+                topic = "Neuroscience",
+                title = "Dopamine & Prediction",
+                content = "Dopamine drives anticipation. Unpredictable reward schedules in digital apps trigger excessive craving loops.",
+                question = "What drives high dopamine release?",
+                options = listOf("Unpredictable reward loops", "Fixed schedules", "Boredom"),
+                correctIndex = 0
             )
         )
     }
@@ -152,7 +159,6 @@ fun DashboardScreen() {
         val savedBlocked = prefs.getStringSet("blocked_packages_set", setOf("com.android.chrome")) ?: emptySet()
 
         val appList = packages.filter { app ->
-            // Filter out system apps and FocusForge itself, but keep user-installed browsers/apps
             app.packageName != context.packageName &&
             ((app.flags and ApplicationInfo.FLAG_SYSTEM) == 0 ||
              app.packageName == "com.android.chrome" ||
@@ -269,7 +275,7 @@ fun DashboardScreen() {
 }
 
 @Composable
-fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: (Int) -> Unit) {
+fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: (Int, Boolean) -> Unit) {
     BackHandler(enabled = true) { }
 
     val context = LocalContext.current
@@ -290,7 +296,9 @@ fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: (Int) -> Unit) {
         )
         LockoutPhase.SUCCESS -> SuccessPhaseView(
             blockedApp = blockedApp,
-            onDismiss = { grantMinutes -> onComplete(grantMinutes) }
+            onDismiss = { grantMinutes, shouldLaunchTarget ->
+                onComplete(grantMinutes, shouldLaunchTarget)
+            }
         )
     }
 }
@@ -532,7 +540,7 @@ fun QuizPhaseView(module: LearningModule, onQuizPassed: () -> Unit) {
 }
 
 @Composable
-fun SuccessPhaseView(blockedApp: String, onDismiss: (Int) -> Unit) {
+fun SuccessPhaseView(blockedApp: String, onDismiss: (Int, Boolean) -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -555,18 +563,18 @@ fun SuccessPhaseView(blockedApp: String, onDismiss: (Int) -> Unit) {
         Spacer(modifier = Modifier.height(28.dp))
 
         Button(
-            onClick = { onDismiss(10) },
+            onClick = { onDismiss(10, true) },
             modifier = Modifier.fillMaxWidth().height(50.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3B82F6)),
             shape = RoundedCornerShape(8.dp)
         ) {
-            Text(text = "Proceed to $blockedApp (10 Min Window)", color = Color.White, fontWeight = FontWeight.SemiBold)
+            Text(text = "Launch Target App (10 Min Access)", color = Color.White, fontWeight = FontWeight.SemiBold)
         }
 
         Spacer(modifier = Modifier.height(12.dp))
 
         OutlinedButton(
-            onClick = { onDismiss(0) },
+            onClick = { onDismiss(0, false) },
             modifier = Modifier.fillMaxWidth().height(50.dp),
             shape = RoundedCornerShape(8.dp)
         ) {
