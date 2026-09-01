@@ -120,17 +120,17 @@ fun loadLearningModules(context: Context): List<LearningModule> {
     } catch (e: Exception) {
         modules.add(
             LearningModule(
-                id = "fallback",
-                topic = "Focus Mechanics",
-                title = "Cognitive Restraint",
-                content = "Friction disrupts automated neurological habits. By taking intentional pauses, prefrontal cognitive control overrides impulse circuits.",
-                question = "What is the primary function of friction in habit loops?",
+                id = "sys_01",
+                topic = "Systems Thinking",
+                title = "Feedback Loops & System Delays",
+                content = "Complex adaptive systems are governed by positive and negative feedback loops. When a significant time delay exists between an action and its feedback, decision-makers overcompensate, creating severe instability.",
+                question = "What primary problem arises from delays in feedback loops?",
                 options = listOf(
-                    "To enable prefrontal control over automated impulses",
-                    "To increase app usage",
-                    "To bypass focus"
+                    "Instant equilibrium",
+                    "Overcorrection and systemic oscillation",
+                    "Total system shutdown"
                 ),
-                correctIndex = 0
+                correctIndex = 1
             )
         )
     }
@@ -152,7 +152,12 @@ fun DashboardScreen() {
         val savedBlocked = prefs.getStringSet("blocked_packages_set", setOf("com.android.chrome")) ?: emptySet()
 
         val appList = packages.filter { app ->
-            (app.flags and ApplicationInfo.FLAG_SYSTEM) == 0 || app.packageName == "com.android.chrome"
+            // Filter out system apps and FocusForge itself, but keep user-installed browsers/apps
+            app.packageName != context.packageName &&
+            ((app.flags and ApplicationInfo.FLAG_SYSTEM) == 0 ||
+             app.packageName == "com.android.chrome" ||
+             app.packageName.contains("youtube") ||
+             app.packageName.contains("browser"))
         }.map { app ->
             InstalledApp(
                 appName = pm.getApplicationLabel(app).toString(),
@@ -175,7 +180,7 @@ fun DashboardScreen() {
                         val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
                         context.startActivity(intent)
                     }) {
-                        Text("Shield Status", color = Color(0xFF3B82F6))
+                        Text("Shield Settings", color = Color(0xFF3B82F6))
                     }
                 }
             )
