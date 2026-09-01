@@ -51,10 +51,13 @@ enum class LockoutPhase { READING, QUIZ, SUCCESS }
 class MainActivity : ComponentActivity() {
 
     private val currentBlockedApp = mutableStateOf<String?>(null)
+    private var isLockoutActive = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        currentBlockedApp.value = intent.getStringExtra("TRIGGERED_BY")
+        val target = intent.getStringExtra("TRIGGERED_BY")
+        currentBlockedApp.value = target
+        isLockoutActive = (target != null)
 
         setContent {
             FocusForgeTheme {
@@ -67,7 +70,9 @@ class MainActivity : ComponentActivity() {
                         TwoPhaseLockoutScreen(
                             blockedApp = blockedApp,
                             onComplete = { grantWindowMinutes, shouldLaunchTarget ->
+                                isLockoutActive = false
                                 grantAccessPass(blockedApp, grantWindowMinutes)
+                                clearLockoutTimers(blockedApp)
                                 currentBlockedApp.value = null
 
                                 if (shouldLaunchTarget) {
@@ -94,7 +99,43 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         setIntent(intent)
-        currentBlockedApp.value = intent?.getStringExtra("TRIGGERED_BY")
+        val target = intent?.getStringExtra("TRIGGERED_BY")
+        currentBlockedApp.value = target
+        isLockoutActive = (target != null)
+    }
+
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        // Triggered when user presses Home or swipes away during an active lockout
+        if (isLockoutActive) {
+            val app = currentBlockedApp.value
+            if (app != null) {
+                applyHomeEscapePenalty(app)
+            }
+        }
+    }
+
+    private fun applyHomeEscapePenalty(packageName: String) {
+        val prefs = getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE)
+        val currentEndTime = prefs.getLong("reading_end_time_${packageName}", 0L)
+        val now = System.currentTimeMillis()
+        
+        // Add 5-minute penalty (300,000 ms) to whatever time remained
+        val baseRemaining = if (currentEndTime > now) currentEndTime - now else 180_000L
+        val penaltyEndTime = now + baseRemaining + (300 * 1000L)
+        
+        prefs.edit()
+            .putLong("reading_end_time_${packageName}", penaltyEndTime)
+            .putBoolean("penalty_applied_${packageName}", true)
+            .apply()
+    }
+
+    private fun clearLockoutTimers(packageName: String) {
+        val prefs = getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE)
+        prefs.edit()
+            .remove("reading_end_time_${packageName}")
+            .remove("penalty_applied_${packageName}")
+            .apply()
     }
 
     private fun grantAccessPass(packageName: String, minutes: Int) {
@@ -133,10 +174,10 @@ fun loadLearningModules(context: Context): List<LearningModule> {
             LearningModule(
                 id = "dop_01",
                 topic = "Neuroscience",
-                title = "Dopamine & Prediction",
-                content = "Dopamine drives anticipation. Unpredictable reward schedules in digital apps trigger excessive craving loops.",
-                question = "What drives high dopamine release?",
-                options = listOf("Unpredictable reward loops", "Fixed schedules", "Boredom"),
+                title = "Dopamine & Anticipation",
+                content = "Dopamine drives pursuit and craving. Enforced friction breaks automatic habits by re-engaging conscious prefrontal evaluation.",
+                question = "What primary function does friction serve?",
+                options = listOf("Re-engaging conscious evaluation", "Increasing scroll speed", "Preventing hardware usage"),
                 correctIndex = 0
             )
         )
@@ -215,7 +256,7 @@ fun DashboardScreen() {
                     color = Color.White
                 )
                 Text(
-                    text = "Toggled apps will trigger the reading and assessment cycle on launch.",
+                    text = "Toggled apps enforce 3-min cooldowns with +5 min penalty on Home bypass.",
                     fontSize = 13.sp,
                     color = Color(0xFF9CA3AF)
                 )
@@ -280,7 +321,7 @@ fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: (Int, Boolean) -> Unit
 
     val context = LocalContext.current
     val modules = remember { loadLearningModules(context) }
-    val activeModule = remember { modules.random() }
+    val activeModule = remember(blockedApp) { modules.random() }
 
     var currentPhase by remember { mutableStateOf(LockoutPhase.READING) }
 
@@ -305,10 +346,32 @@ fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: (Int, Boolean) -> Unit
 
 @Composable
 fun ReadingPhaseView(blockedApp: String, module: LearningModule, onReadingComplete: () -> Unit) {
-    var timeLeftSeconds by remember { mutableStateOf(300L) }
-    var isTimerFinished by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE) }
+    
+    val baseDurationSeconds = 180L // 3 minutes baseline
+    
+    val penaltyActive = remember(blockedApp) {
+        prefs.getBoolean("penalty_applied_${blockedApp}", false)
+    }
 
-    DisposableEffect(Unit) {
+    var timeLeftSeconds by remember(blockedApp) {
+        val storedEndTime = prefs.getLong("reading_end_time_${blockedApp}", 0L)
+        val currentTime = System.currentTimeMillis()
+
+        val remaining = if (storedEndTime > currentTime) {
+            (storedEndTime - currentTime) / 1000
+        } else {
+            val newEndTime = currentTime + (baseDurationSeconds * 1000)
+            prefs.edit().putLong("reading_end_time_${blockedApp}", newEndTime).apply()
+            baseDurationSeconds
+        }
+        mutableStateOf(remaining)
+    }
+
+    var isTimerFinished by remember(blockedApp) { mutableStateOf(timeLeftSeconds <= 0) }
+
+    DisposableEffect(blockedApp) {
         val timer = object : CountDownTimer(timeLeftSeconds * 1000, 1000) {
             override fun onTick(millisUntilFinished: Long) {
                 timeLeftSeconds = millisUntilFinished / 1000
@@ -338,7 +401,7 @@ fun ReadingPhaseView(blockedApp: String, module: LearningModule, onReadingComple
     ) {
         Spacer(modifier = Modifier.height(24.dp))
         Text(
-            text = "PHASE 1: COGNITIVE ENGAGEMENT",
+            text = if (penaltyActive) "PENALTY SURCHARGE APPLIED (+5 MIN)" else "PHASE 1: COGNITIVE RESET",
             color = Color(0xFFEF4444),
             fontSize = 13.sp,
             fontWeight = FontWeight.Bold
@@ -358,9 +421,9 @@ fun ReadingPhaseView(blockedApp: String, module: LearningModule, onReadingComple
             color = Color.White
         )
         Text(
-            text = "Mandatory Reading Duration",
+            text = if (penaltyActive) "Bypass Detected - Surcharge Active" else "Mandatory Cooldown Buffer",
             fontSize = 13.sp,
-            color = Color(0xFF6B7280)
+            color = if (penaltyActive) Color(0xFFEF4444) else Color(0xFF6B7280)
         )
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -402,7 +465,7 @@ fun ReadingPhaseView(blockedApp: String, module: LearningModule, onReadingComple
             shape = RoundedCornerShape(8.dp)
         ) {
             Text(
-                text = if (isTimerFinished) "Start Assessment Quiz" else "Reading Phase Locked ($formattedTime)",
+                text = if (isTimerFinished) "Start Assessment Quiz" else "Cooldown Active ($formattedTime)",
                 color = if (isTimerFinished) Color.White else Color(0xFF737373),
                 fontWeight = FontWeight.SemiBold
             )
