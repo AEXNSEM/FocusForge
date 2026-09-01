@@ -1,11 +1,16 @@
 package com.focusforge.app
 
+import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.os.CountDownTimer
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -23,9 +28,11 @@ import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
+    private val currentBlockedApp = mutableStateOf<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val triggeredApp = intent.getStringExtra("TRIGGERED_BY")
+        currentBlockedApp.value = intent.getStringExtra("TRIGGERED_BY")
 
         setContent {
             FocusForgeTheme {
@@ -33,8 +40,15 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = Color(0xFF121212)
                 ) {
-                    if (triggeredApp != null) {
-                        LockoutScreen(blockedApp = triggeredApp)
+                    val blockedApp = currentBlockedApp.value
+                    if (blockedApp != null) {
+                        TwoPhaseLockoutScreen(
+                            blockedApp = blockedApp,
+                            onComplete = {
+                                currentBlockedApp.value = null
+                                moveTaskToBack(true)
+                            }
+                        )
                     } else {
                         DashboardScreen()
                     }
@@ -42,7 +56,25 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        currentBlockedApp.value = intent?.getStringExtra("TRIGGERED_BY")
+    }
 }
+
+enum class LockoutPhase {
+    READING,
+    QUIZ,
+    SUCCESS
+}
+
+data class QuizQuestion(
+    val question: String,
+    val options: List<String>,
+    val correctIndex: Int
+)
 
 @Composable
 fun DashboardScreen() {
@@ -76,14 +108,14 @@ fun DashboardScreen() {
         ) {
             Column(modifier = Modifier.padding(20.dp)) {
                 Text(
-                    text = "System Setup",
+                    text = "System Status",
                     fontWeight = FontWeight.SemiBold,
-                    color = Color.White,
+                    color = Color(0xFF10B981),
                     fontSize = 18.sp
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "Enable the service below to activate automatic target interception.",
+                    text = "Interception active. Triggering a blocked app will start the 15-minute lockout.",
                     color = Color(0xFFB0B0B0),
                     fontSize = 14.sp
                 )
@@ -97,7 +129,7 @@ fun DashboardScreen() {
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3B82F6)),
                     shape = RoundedCornerShape(8.dp)
                 ) {
-                    Text(text = "Open Accessibility Settings", color = Color.White)
+                    Text(text = "Manage Accessibility Settings", color = Color.White)
                 }
             }
         }
@@ -105,12 +137,34 @@ fun DashboardScreen() {
 }
 
 @Composable
-fun LockoutScreen(blockedApp: String) {
+fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: () -> Unit) {
+    // Prevent the user from backing out of the lock screen
+    BackHandler(enabled = true) { /* Consume back press */ }
+
+    var currentPhase by remember { mutableStateOf(LockoutPhase.READING) }
+
+    when (currentPhase) {
+        LockoutPhase.READING -> ReadingPhaseView(
+            blockedApp = blockedApp,
+            onReadingComplete = { currentPhase = LockoutPhase.QUIZ }
+        )
+        LockoutPhase.QUIZ -> QuizPhaseView(
+            onQuizPassed = { currentPhase = LockoutPhase.SUCCESS }
+        )
+        LockoutPhase.SUCCESS -> SuccessPhaseView(
+            onDismiss = onComplete
+        )
+    }
+}
+
+@Composable
+fun ReadingPhaseView(blockedApp: String, onReadingComplete: () -> Unit) {
+    // 5 minutes (300 seconds)
     var timeLeftSeconds by remember { mutableStateOf(300L) }
     var isTimerFinished by remember { mutableStateOf(false) }
 
     DisposableEffect(Unit) {
-        val timer = object : CountDownTimer(300000, 1000) {
+        val timer = object : CountDownTimer(timeLeftSeconds * 1000, 1000) {
             override fun onTick(millisUntilFinished: Long) {
                 timeLeftSeconds = millisUntilFinished / 1000
             }
@@ -137,34 +191,34 @@ fun LockoutScreen(blockedApp: String) {
             .verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(24.dp))
         Text(
-            text = "DOPAMINE INTERCEPT ACTIVE",
+            text = "PHASE 1: COGNITIVE ENGAGEMENT",
             color = Color(0xFFEF4444),
-            fontSize = 14.sp,
+            fontSize = 13.sp,
             fontWeight = FontWeight.Bold
         )
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(4.dp))
         Text(
-            text = "App Blocked: $blockedApp",
+            text = "Blocked Target: $blockedApp",
             color = Color(0xFF9CA3AF),
             fontSize = 12.sp
         )
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(20.dp))
 
         Text(
             text = formattedTime,
-            fontSize = 54.sp,
+            fontSize = 52.sp,
             fontWeight = FontWeight.ExtraBold,
             color = Color.White
         )
         Text(
-            text = "Mandatory Cognitive Engagement",
+            text = "Mandatory Reading Timer",
             fontSize = 13.sp,
             color = Color(0xFF6B7280)
         )
 
-        Spacer(modifier = Modifier.height(28.dp))
+        Spacer(modifier = Modifier.height(24.dp))
 
         Card(
             modifier = Modifier.fillMaxWidth(),
@@ -173,14 +227,16 @@ fun LockoutScreen(blockedApp: String) {
         ) {
             Column(modifier = Modifier.padding(20.dp)) {
                 Text(
-                    text = "Module: Market Structure & Liquidity Pools",
+                    text = "Market Microstructure: Liquidity Sweeps",
                     fontWeight = FontWeight.Bold,
                     color = Color.White,
                     fontSize = 16.sp
                 )
-                Spacer(modifier = Modifier.height(12.dp))
+                Spacer(modifier = Modifier.height(10.dp))
                 Text(
-                    text = "Liquidity represents the concentration of pending orders resting above key swing highs and below swing lows. Institutional participants require substantial counterpart volume to fill large orders without slippage.\n\nWhen retail traders place stop-loss orders below obvious double-bottom formations, they create sell stops. Institutions engineer price runs into these pools to accumulate long positions before reversing trend.",
+                    text = "A liquidity sweep occurs when price aggressively drives beyond a key high or low to trigger clustered stop orders before immediately reversing.\n\n" +
+                            "Institutional orders cannot be placed into standard book volume without causing severe slippage. To accumulate a large long position, an institution requires counterpart sellers. By driving price below an established support level, retail stop-loss orders (which become market sell orders) are activated.\n\n" +
+                            "The institution absorbs these sell orders at a discounted price, and the lack of remaining supply allows the price to reverse sharply upward.",
                     color = Color(0xFFD1D5DB),
                     fontSize = 14.sp,
                     lineHeight = 22.sp
@@ -188,23 +244,201 @@ fun LockoutScreen(blockedApp: String) {
             }
         }
 
-        Spacer(modifier = Modifier.height(28.dp))
+        Spacer(modifier = Modifier.height(24.dp))
 
         Button(
-            onClick = { },
+            onClick = onReadingComplete,
             enabled = isTimerFinished,
-            modifier = Modifier.fillMaxWidth().height(50.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp),
             colors = ButtonDefaults.buttonColors(
-                containerColor = Color(0xFF10B981),
-                disabledContainerColor = Color(0xFF374151)
+                containerColor = Color(0xFF3B82F6),
+                disabledContainerColor = Color(0xFF262626)
             ),
             shape = RoundedCornerShape(8.dp)
         ) {
             Text(
-                text = if (isTimerFinished) "Proceed to Assessment Quiz" else "Reading Phase Locked ($formattedTime)",
-                color = if (isTimerFinished) Color.White else Color(0xFF9CA3AF),
+                text = if (isTimerFinished) "Start Assessment Quiz" else "Reading Phase Locked ($formattedTime)",
+                color = if (isTimerFinished) Color.White else Color(0xFF737373),
                 fontWeight = FontWeight.SemiBold
             )
+        }
+    }
+}
+
+@Composable
+fun QuizPhaseView(onQuizPassed: () -> Unit) {
+    // 10 minutes quiz timer (600 seconds)
+    var timeLeftSeconds by remember { mutableStateOf(600L) }
+    var selectedOption by remember { mutableStateOf<Int?>(null) }
+    var errorMessage by remember { mutableStateOf("") }
+
+    val sampleQuestion = remember {
+        QuizQuestion(
+            question = "Why do institutional buyers push price below key support levels prior to an upward trend reversal?",
+            options = listOf(
+                "To trigger sell stop-loss orders and absorb the necessary sell volume at a discount.",
+                "To allow retail traders to open profitable short positions.",
+                "Because support levels automatically guarantee a permanent price collapse.",
+                "To reduce overall trading exchange fees."
+            ),
+            correctIndex = 0
+        )
+    }
+
+    DisposableEffect(Unit) {
+        val timer = object : CountDownTimer(timeLeftSeconds * 1000, 1000) {
+            override fun onTick(millisUntilFinished: Long) {
+                timeLeftSeconds = millisUntilFinished / 1000
+            }
+
+            override fun onFinish() {
+                timeLeftSeconds = 0
+            }
+        }.start()
+
+        onDispose {
+            timer.cancel()
+        }
+    }
+
+    val minutes = timeLeftSeconds / 60
+    val seconds = timeLeftSeconds % 60
+    val formattedTime = String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds)
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp)
+            .verticalScroll(rememberScrollState()),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Spacer(modifier = Modifier.height(24.dp))
+        Text(
+            text = "PHASE 2: ASSESSMENT QUIZ",
+            color = Color(0xFFF59E0B),
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = "Time Remaining: $formattedTime",
+            color = Color.White,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.SemiBold
+        )
+        Spacer(modifier = Modifier.height(20.dp))
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Column(modifier = Modifier.padding(20.dp)) {
+                Text(
+                    text = sampleQuestion.question,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White,
+                    fontSize = 15.sp,
+                    lineHeight = 22.sp
+                )
+                Spacer(modifier = Modifier.height(18.dp))
+
+                sampleQuestion.options.forEachIndexed { index, optionText ->
+                    val isSelected = selectedOption == index
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 6.dp)
+                            .background(
+                                color = if (isSelected) Color(0xFF2563EB) else Color(0xFF262626),
+                                shape = RoundedCornerShape(8.dp)
+                            )
+                            .clickable {
+                                selectedOption = index
+                                errorMessage = ""
+                            }
+                            .padding(14.dp)
+                    ) {
+                        Text(
+                            text = optionText,
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp
+                        )
+                    }
+                }
+            }
+        }
+
+        if (errorMessage.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = errorMessage,
+                color = Color(0xFFEF4444),
+                fontSize = 13.sp
+            )
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Button(
+            onClick = {
+                if (selectedOption == sampleQuestion.correctIndex) {
+                    onQuizPassed()
+                } else {
+                    errorMessage = "Incorrect answer. Review the concept and try again."
+                }
+            },
+            enabled = selectedOption != null,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(50.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Color(0xFF10B981),
+                disabledContainerColor = Color(0xFF262626)
+            ),
+            shape = RoundedCornerShape(8.dp)
+        ) {
+            Text(
+                text = "Submit Answer",
+                color = if (selectedOption != null) Color.White else Color(0xFF737373),
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+    }
+}
+
+@Composable
+fun SuccessPhaseView(onDismiss: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "Lockout Cleared",
+            fontSize = 26.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color(0xFF10B981)
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = "Cognitive engagement threshold met. Proceed with intentionality.",
+            color = Color(0xFFB0B0B0),
+            fontSize = 14.sp
+        )
+        Spacer(modifier = Modifier.height(28.dp))
+        Button(
+            onClick = onDismiss,
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
+            shape = RoundedCornerShape(8.dp)
+        ) {
+            Text(text = "Exit to Device", color = Color.White, fontWeight = FontWeight.SemiBold)
         }
     }
 }
