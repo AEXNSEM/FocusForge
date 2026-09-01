@@ -2,6 +2,8 @@ package com.focusforge.app
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.CountDownTimer
 import android.provider.Settings
@@ -11,6 +13,8 @@ import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -23,7 +27,26 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import org.json.JSONArray
 import java.util.Locale
+
+data class LearningModule(
+    val id: String,
+    val topic: String,
+    val title: String,
+    val content: String,
+    val question: String,
+    val options: List<String>,
+    val correctIndex: Int
+)
+
+data class InstalledApp(
+    val appName: String,
+    val packageName: String,
+    var isBlocked: Boolean
+)
+
+enum class LockoutPhase { READING, QUIZ, SUCCESS }
 
 class MainActivity : ComponentActivity() {
 
@@ -70,72 +93,170 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-enum class LockoutPhase {
-    READING,
-    QUIZ,
-    SUCCESS
+fun loadLearningModules(context: Context): List<LearningModule> {
+    val modules = mutableListOf<LearningModule>()
+    try {
+        val jsonString = context.assets.open("modules.json").bufferedReader().use { it.readText() }
+        val array = JSONArray(jsonString)
+        for (i in 0 until array.length()) {
+            val obj = array.getJSONObject(i)
+            val optionsJson = obj.getJSONArray("options")
+            val optionsList = mutableListOf<String>()
+            for (j in 0 until optionsJson.length()) {
+                optionsList.add(optionsJson.getString(j))
+            }
+            modules.add(
+                LearningModule(
+                    id = obj.getString("id"),
+                    topic = obj.getString("topic"),
+                    title = obj.getString("title"),
+                    content = obj.getString("content"),
+                    question = obj.getString("question"),
+                    options = optionsList,
+                    correctIndex = obj.getInt("correctIndex")
+                )
+            )
+        }
+    } catch (e: Exception) {
+        modules.add(
+            LearningModule(
+                id = "fallback",
+                topic = "Focus Mechanics",
+                title = "Cognitive Restraint",
+                content = "Friction disrupts automated neurological habits. By taking intentional pauses, prefrontal cognitive control overrides impulse circuits.",
+                question = "What is the primary function of friction in habit loops?",
+                options = listOf(
+                    "To enable prefrontal control over automated impulses",
+                    "To increase app usage",
+                    "To bypass focus"
+                ),
+                correctIndex = 0
+            )
+        )
+    }
+    return modules
 }
 
-data class QuizQuestion(
-    val question: String,
-    val options: List<String>,
-    val correctIndex: Int
-)
-
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DashboardScreen() {
     val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE) }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text(
-            text = "FocusForge",
-            fontSize = 32.sp,
-            fontWeight = FontWeight.Bold,
-            color = Color.White
-        )
-        Spacer(modifier = Modifier.height(6.dp))
-        Text(
-            text = "High-Friction Dopamine Interceptor",
-            fontSize = 14.sp,
-            color = Color(0xFF888888)
-        )
-        Spacer(modifier = Modifier.height(36.dp))
+    var installedApps by remember { mutableStateOf<List<InstalledApp>>(emptyList()) }
+    var isLoading by remember { mutableStateOf(true) }
 
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Column(modifier = Modifier.padding(20.dp)) {
-                Text(
-                    text = "Shield Operational",
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color(0xFF10B981),
-                    fontSize = 18.sp
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = "Interception running. Launching blocked targets forces cognitive review before access is evaluated.",
-                    color = Color(0xFFB0B0B0),
-                    fontSize = 14.sp
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-                Button(
-                    onClick = {
+    LaunchedEffect(Unit) {
+        val pm = context.packageManager
+        val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+        val savedBlocked = prefs.getStringSet("blocked_packages_set", setOf("com.android.chrome")) ?: emptySet()
+
+        val appList = packages.filter { app ->
+            (app.flags and ApplicationInfo.FLAG_SYSTEM) == 0 || app.packageName == "com.android.chrome"
+        }.map { app ->
+            InstalledApp(
+                appName = pm.getApplicationLabel(app).toString(),
+                packageName = app.packageName,
+                isBlocked = savedBlocked.contains(app.packageName)
+            )
+        }.sortedBy { it.appName.lowercase(Locale.getDefault()) }
+
+        installedApps = appList
+        isLoading = false
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("FocusForge", color = Color.White, fontWeight = FontWeight.Bold) },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color(0xFF1E1E1E)),
+                actions = {
+                    TextButton(onClick = {
                         val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
                         context.startActivity(intent)
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3B82F6)),
-                    shape = RoundedCornerShape(8.dp)
+                    }) {
+                        Text("Shield Status", color = Color(0xFF3B82F6))
+                    }
+                }
+            )
+        },
+        containerColor = Color(0xFF121212)
+    ) { innerPadding ->
+        if (isLoading) {
+            Box(
+                modifier = Modifier.fillMaxSize().padding(innerPadding),
+                contentAlignment = Alignment.Center
+            ) {
+                CircularProgressIndicator(color = Color(0xFF3B82F6))
+            }
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+                    .padding(horizontal = 16.dp)
+            ) {
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = "Select Target Apps to Intercept",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White
+                )
+                Text(
+                    text = "Toggled apps will trigger the reading and assessment cycle on launch.",
+                    fontSize = 13.sp,
+                    color = Color(0xFF9CA3AF)
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text(text = "Manage Accessibility Settings", color = Color.White)
+                    items(installedApps, key = { it.packageName }) { app ->
+                        Card(
+                            modifier = Modifier.fillMaxWidth(),
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = app.appName,
+                                        fontWeight = FontWeight.Medium,
+                                        color = Color.White,
+                                        fontSize = 15.sp
+                                    )
+                                    Text(
+                                        text = app.packageName,
+                                        color = Color(0xFF6B7280),
+                                        fontSize = 11.sp
+                                    )
+                                }
+                                Switch(
+                                    checked = app.isBlocked,
+                                    onCheckedChange = { isChecked ->
+                                        installedApps = installedApps.map {
+                                            if (it.packageName == app.packageName) it.copy(isBlocked = isChecked) else it
+                                        }
+                                        val updatedSet = installedApps.filter { it.isBlocked }.map { it.packageName }.toSet()
+                                        prefs.edit().putStringSet("blocked_packages_set", updatedSet).apply()
+                                    },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = Color.White,
+                                        checkedTrackColor = Color(0xFFEF4444)
+                                    )
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -144,16 +265,22 @@ fun DashboardScreen() {
 
 @Composable
 fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: (Int) -> Unit) {
-    BackHandler(enabled = true) { /* Block hardware back */ }
+    BackHandler(enabled = true) { }
+
+    val context = LocalContext.current
+    val modules = remember { loadLearningModules(context) }
+    val activeModule = remember { modules.random() }
 
     var currentPhase by remember { mutableStateOf(LockoutPhase.READING) }
 
     when (currentPhase) {
         LockoutPhase.READING -> ReadingPhaseView(
             blockedApp = blockedApp,
+            module = activeModule,
             onReadingComplete = { currentPhase = LockoutPhase.QUIZ }
         )
         LockoutPhase.QUIZ -> QuizPhaseView(
+            module = activeModule,
             onQuizPassed = { currentPhase = LockoutPhase.SUCCESS }
         )
         LockoutPhase.SUCCESS -> SuccessPhaseView(
@@ -164,8 +291,7 @@ fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: (Int) -> Unit) {
 }
 
 @Composable
-fun ReadingPhaseView(blockedApp: String, onReadingComplete: () -> Unit) {
-    // 5 minutes (300s)
+fun ReadingPhaseView(blockedApp: String, module: LearningModule, onReadingComplete: () -> Unit) {
     var timeLeftSeconds by remember { mutableStateOf(300L) }
     var isTimerFinished by remember { mutableStateOf(false) }
 
@@ -206,7 +332,7 @@ fun ReadingPhaseView(blockedApp: String, onReadingComplete: () -> Unit) {
         )
         Spacer(modifier = Modifier.height(4.dp))
         Text(
-            text = "Blocked Target: $blockedApp",
+            text = "Target: $blockedApp",
             color = Color(0xFF9CA3AF),
             fontSize = 12.sp
         )
@@ -219,7 +345,7 @@ fun ReadingPhaseView(blockedApp: String, onReadingComplete: () -> Unit) {
             color = Color.White
         )
         Text(
-            text = "Mandatory Reading Timer",
+            text = "Mandatory Reading Duration",
             fontSize = 13.sp,
             color = Color(0xFF6B7280)
         )
@@ -233,16 +359,14 @@ fun ReadingPhaseView(blockedApp: String, onReadingComplete: () -> Unit) {
         ) {
             Column(modifier = Modifier.padding(20.dp)) {
                 Text(
-                    text = "Market Microstructure: Liquidity Sweeps",
+                    text = "${module.topic}: ${module.title}",
                     fontWeight = FontWeight.Bold,
                     color = Color.White,
                     fontSize = 16.sp
                 )
                 Spacer(modifier = Modifier.height(10.dp))
                 Text(
-                    text = "A liquidity sweep occurs when price aggressively drives beyond an obvious support or resistance level to trigger clustered stop orders before immediately reversing.\n\n" +
-                            "Large institutions cannot enter substantial positions in regular trading volume without suffering severe slippage. By pushing price past common retail stop-loss zones, they force massive stop-loss sell orders to trigger.\n\n" +
-                            "The institution absorbs this concentrated selling volume at a discount, filling their long orders completely before letting the market reverse higher.",
+                    text = module.content,
                     color = Color(0xFFD1D5DB),
                     fontSize = 14.sp,
                     lineHeight = 22.sp
@@ -274,23 +398,10 @@ fun ReadingPhaseView(blockedApp: String, onReadingComplete: () -> Unit) {
 }
 
 @Composable
-fun QuizPhaseView(onQuizPassed: () -> Unit) {
+fun QuizPhaseView(module: LearningModule, onQuizPassed: () -> Unit) {
     var timeLeftSeconds by remember { mutableStateOf(600L) }
     var selectedOption by remember { mutableStateOf<Int?>(null) }
     var errorMessage by remember { mutableStateOf("") }
-
-    val sampleQuestion = remember {
-        QuizQuestion(
-            question = "Why do institutional buyers push price below key support levels prior to an upward trend reversal?",
-            options = listOf(
-                "To trigger sell stop-loss orders and absorb the necessary sell volume at a discount.",
-                "To allow retail traders to open profitable short positions.",
-                "Because support levels automatically guarantee a permanent price collapse.",
-                "To reduce overall trading exchange fees."
-            ),
-            correctIndex = 0
-        )
-    }
 
     DisposableEffect(Unit) {
         val timer = object : CountDownTimer(timeLeftSeconds * 1000, 1000) {
@@ -342,7 +453,7 @@ fun QuizPhaseView(onQuizPassed: () -> Unit) {
         ) {
             Column(modifier = Modifier.padding(20.dp)) {
                 Text(
-                    text = sampleQuestion.question,
+                    text = module.question,
                     fontWeight = FontWeight.SemiBold,
                     color = Color.White,
                     fontSize = 15.sp,
@@ -350,7 +461,7 @@ fun QuizPhaseView(onQuizPassed: () -> Unit) {
                 )
                 Spacer(modifier = Modifier.height(18.dp))
 
-                sampleQuestion.options.forEachIndexed { index, optionText ->
+                module.options.forEachIndexed { index, optionText ->
                     val isSelected = selectedOption == index
                     Box(
                         modifier = Modifier
@@ -390,7 +501,7 @@ fun QuizPhaseView(onQuizPassed: () -> Unit) {
 
         Button(
             onClick = {
-                if (selectedOption == sampleQuestion.correctIndex) {
+                if (selectedOption == module.correctIndex) {
                     onQuizPassed()
                 } else {
                     errorMessage = "Incorrect answer. Review the concept and try again."
@@ -438,7 +549,6 @@ fun SuccessPhaseView(blockedApp: String, onDismiss: (Int) -> Unit) {
         )
         Spacer(modifier = Modifier.height(28.dp))
 
-        // Option A: Intentional 10-Minute Work Window
         Button(
             onClick = { onDismiss(10) },
             modifier = Modifier.fillMaxWidth().height(50.dp),
@@ -450,7 +560,6 @@ fun SuccessPhaseView(blockedApp: String, onDismiss: (Int) -> Unit) {
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // Option B: Pure Deterrence (No access, close to home)
         OutlinedButton(
             onClick = { onDismiss(0) },
             modifier = Modifier.fillMaxWidth().height(50.dp),
