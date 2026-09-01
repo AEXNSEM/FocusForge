@@ -9,7 +9,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -44,7 +43,8 @@ class MainActivity : ComponentActivity() {
                     if (blockedApp != null) {
                         TwoPhaseLockoutScreen(
                             blockedApp = blockedApp,
-                            onComplete = {
+                            onComplete = { grantWindowMinutes ->
+                                grantAccessPass(blockedApp, grantWindowMinutes)
                                 currentBlockedApp.value = null
                                 moveTaskToBack(true)
                             }
@@ -61,6 +61,12 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         currentBlockedApp.value = intent?.getStringExtra("TRIGGERED_BY")
+    }
+
+    private fun grantAccessPass(packageName: String, minutes: Int) {
+        val prefs = getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE)
+        val expiryTime = System.currentTimeMillis() + (minutes * 60 * 1000L)
+        prefs.edit().putLong("unlock_expiry_${packageName}", expiryTime).apply()
     }
 }
 
@@ -108,14 +114,14 @@ fun DashboardScreen() {
         ) {
             Column(modifier = Modifier.padding(20.dp)) {
                 Text(
-                    text = "System Status",
+                    text = "Shield Operational",
                     fontWeight = FontWeight.SemiBold,
                     color = Color(0xFF10B981),
                     fontSize = 18.sp
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "Interception active. Triggering a blocked app will start the 15-minute lockout.",
+                    text = "Interception running. Launching blocked targets forces cognitive review before access is evaluated.",
                     color = Color(0xFFB0B0B0),
                     fontSize = 14.sp
                 )
@@ -137,9 +143,8 @@ fun DashboardScreen() {
 }
 
 @Composable
-fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: () -> Unit) {
-    // Prevent the user from backing out of the lock screen
-    BackHandler(enabled = true) { /* Consume back press */ }
+fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: (Int) -> Unit) {
+    BackHandler(enabled = true) { /* Block hardware back */ }
 
     var currentPhase by remember { mutableStateOf(LockoutPhase.READING) }
 
@@ -152,14 +157,15 @@ fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: () -> Unit) {
             onQuizPassed = { currentPhase = LockoutPhase.SUCCESS }
         )
         LockoutPhase.SUCCESS -> SuccessPhaseView(
-            onDismiss = onComplete
+            blockedApp = blockedApp,
+            onDismiss = { grantMinutes -> onComplete(grantMinutes) }
         )
     }
 }
 
 @Composable
 fun ReadingPhaseView(blockedApp: String, onReadingComplete: () -> Unit) {
-    // 5 minutes (300 seconds)
+    // 5 minutes (300s)
     var timeLeftSeconds by remember { mutableStateOf(300L) }
     var isTimerFinished by remember { mutableStateOf(false) }
 
@@ -234,9 +240,9 @@ fun ReadingPhaseView(blockedApp: String, onReadingComplete: () -> Unit) {
                 )
                 Spacer(modifier = Modifier.height(10.dp))
                 Text(
-                    text = "A liquidity sweep occurs when price aggressively drives beyond a key high or low to trigger clustered stop orders before immediately reversing.\n\n" +
-                            "Institutional orders cannot be placed into standard book volume without causing severe slippage. To accumulate a large long position, an institution requires counterpart sellers. By driving price below an established support level, retail stop-loss orders (which become market sell orders) are activated.\n\n" +
-                            "The institution absorbs these sell orders at a discounted price, and the lack of remaining supply allows the price to reverse sharply upward.",
+                    text = "A liquidity sweep occurs when price aggressively drives beyond an obvious support or resistance level to trigger clustered stop orders before immediately reversing.\n\n" +
+                            "Large institutions cannot enter substantial positions in regular trading volume without suffering severe slippage. By pushing price past common retail stop-loss zones, they force massive stop-loss sell orders to trigger.\n\n" +
+                            "The institution absorbs this concentrated selling volume at a discount, filling their long orders completely before letting the market reverse higher.",
                     color = Color(0xFFD1D5DB),
                     fontSize = 14.sp,
                     lineHeight = 22.sp
@@ -269,7 +275,6 @@ fun ReadingPhaseView(blockedApp: String, onReadingComplete: () -> Unit) {
 
 @Composable
 fun QuizPhaseView(onQuizPassed: () -> Unit) {
-    // 10 minutes quiz timer (600 seconds)
     var timeLeftSeconds by remember { mutableStateOf(600L) }
     var selectedOption by remember { mutableStateOf<Int?>(null) }
     var errorMessage by remember { mutableStateOf("") }
@@ -411,7 +416,7 @@ fun QuizPhaseView(onQuizPassed: () -> Unit) {
 }
 
 @Composable
-fun SuccessPhaseView(onDismiss: () -> Unit) {
+fun SuccessPhaseView(blockedApp: String, onDismiss: (Int) -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -420,25 +425,38 @@ fun SuccessPhaseView(onDismiss: () -> Unit) {
         verticalArrangement = Arrangement.Center
     ) {
         Text(
-            text = "Lockout Cleared",
+            text = "Threshold Completed",
             fontSize = 26.sp,
             fontWeight = FontWeight.Bold,
             color = Color(0xFF10B981)
         )
         Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text = "Cognitive engagement threshold met. Proceed with intentionality.",
+            text = "Cognitive engagement verified. Choose how you wish to proceed.",
             color = Color(0xFFB0B0B0),
             fontSize = 14.sp
         )
         Spacer(modifier = Modifier.height(28.dp))
+
+        // Option A: Intentional 10-Minute Work Window
         Button(
-            onClick = onDismiss,
+            onClick = { onDismiss(10) },
             modifier = Modifier.fillMaxWidth().height(50.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3B82F6)),
             shape = RoundedCornerShape(8.dp)
         ) {
-            Text(text = "Exit to Device", color = Color.White, fontWeight = FontWeight.SemiBold)
+            Text(text = "Proceed to $blockedApp (10 Min Window)", color = Color.White, fontWeight = FontWeight.SemiBold)
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Option B: Pure Deterrence (No access, close to home)
+        OutlinedButton(
+            onClick = { onDismiss(0) },
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+            shape = RoundedCornerShape(8.dp)
+        ) {
+            Text(text = "Exit to Home (Keep App Locked)", color = Color(0xFF9CA3AF))
         }
     }
 }
