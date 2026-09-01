@@ -1,0 +1,44 @@
+[
+  {
+    "id": "fin_01",
+    "topic": "Market Microstructure",
+    "title": "Liquidity Sweeps & Order Flow",
+    "content": "A liquidity sweep occurs when price aggressively drives beyond an established support or resistance level to trigger clustered stop orders before immediately reversing.\n\nInstitutional participants cannot execute large positions within standard limit order books without incurring severe slippage. To accumulate a massive long position, an institution requires an equivalent volume of market sell orders. By driving price below an obvious swing low, retail stop-loss sell orders are systematically triggered.\n\nThe institution absorbs this concentrated selling liquidity at a discount, filling their position before allowing the market to reverse upward.",
+    "question": "Why do institutional participants deliberately drive price past obvious support levels before reversing upward?",
+    "options": [
+      "To trigger clustered retail stop-loss orders and absorb the necessary sell volume at a discount.",
+      "To ensure that exchange transaction fees are minimized across all executed blocks.",
+      "To allow retail trend-followers to open profitable short positions.",
+      "Because crossing support levels mathematically forces a long-term bearish trend."
+    ],
+    "correctIndex": 0
+  },
+  {
+    "id": "sys_01",
+    "topic": "Systems Thinking",
+    "title": "Feedback Loops & System Delays",
+    "content": "Complex adaptive systems are governed by positive (reinforcing) and negative (balancing) feedback loops, often complicated by material time delays.\n\nA reinforcing loop compounds change, leading to exponential growth or collapse, while a balancing loop seeks equilibrium around a goal state. When a significant time delay exists between an action and its observable feedback, decision-makers frequently overcompensate, creating severe oscillations and system instability.\n\nEffective system intervention requires identifying structural bottlenecks rather than reacting to short-term symptoms.",
+    "question": "What primary problem arises when there is a significant time delay in a balancing feedback loop?",
+    "options": [
+      "The system enters immediate, static equilibrium without fluctuation.",
+      "Decision-makers tend to overcorrect, inducing severe oscillations and instability.",
+      "All reinforcing loops in the system are permanently converted into linear chains.",
+      "The goal state of the system is completely erased."
+    ],
+    "correctIndex": 1
+  },
+  {
+    "id": "cog_01",
+    "topic": "Cognitive Science",
+    "title": "Hyperbolic Discounting & Present Bias",
+    "content": "Hyperbolic discounting is a cognitive model explaining why humans disproportionately prefer smaller, immediate rewards over larger, delayed rewards when the delay is near the present.\n\nUnlike exponential discounting (which applies a constant discount rate over time), hyperbolic discounting leads to dynamic inconsistency: preferences change as the time to reward draws closer. A subject may prefer $110 in 31 days over $100 in 30 days, yet choose $100 today over $110 tomorrow, despite the time interval and payout difference being identical.\n\nThis bias underpins compulsive digital usage, as algorithmic micro-rewards provide instant neurological gratification relative to high-delay cognitive efforts.",
+    "question": "What distinguishes hyperbolic discounting from exponential discounting?",
+    "options": [
+      "Hyperbolic discounting maintains a completely fixed mathematical rate over any time horizon.",
+      "Hyperbolic discounting produces dynamic inconsistency, overvaluing immediate rewards over future gains.",
+      "Hyperbolic discounting only applies to financial transactions, not human behavior.",
+      "Exponential discounting assumes immediate rewards have zero perceived value."
+    ],
+    "correctIndex": 1
+  }
+]
