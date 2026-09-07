@@ -51,12 +51,12 @@ enum class LockoutPhase { READING, QUIZ, SUCCESS }
 class MainActivity : ComponentActivity() {
 
     private val currentBlockedApp = mutableStateOf<String?>(null)
-    private val activeEndTime = mutableStateOf(0L)
-    private val triggerStamp = mutableStateOf(0L)
+    private val currentMode = mutableStateOf<String?>("DASHBOARD")
+    private val quarantineEnd = mutableStateOf(0L)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        extractIntentParams(intent)
+        parseIntentData(intent)
 
         setContent {
             FocusForgeTheme {
@@ -64,32 +64,52 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = Color(0xFF121212)
                 ) {
-                    val blockedApp = currentBlockedApp.value
-                    if (blockedApp != null) {
-                        TwoPhaseLockoutScreen(
-                            blockedApp = blockedApp,
-                            endTime = activeEndTime.value,
-                            triggerStamp = triggerStamp.value,
-                            onComplete = { grantWindowMinutes, shouldLaunchTarget ->
-                                grantAccessPass(blockedApp, grantWindowMinutes)
-                                clearLockoutTimers(blockedApp)
-                                currentBlockedApp.value = null
+                    val app = currentBlockedApp.value
+                    val mode = currentMode.value
 
-                                if (shouldLaunchTarget) {
-                                    val launchIntent = packageManager.getLaunchIntentForPackage(blockedApp)
-                                    if (launchIntent != null) {
-                                        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                        startActivity(launchIntent)
-                                    } else {
-                                        moveTaskToBack(true)
-                                    }
-                                } else {
+                    when {
+                        mode == "QUARANTINE_HAMMER" && app != null -> {
+                            QuarantineScreen(
+                                blockedApp = app,
+                                endTime = quarantineEnd.value,
+                                onExit = { moveTaskToBack(true) }
+                            )
+                        }
+                        mode == "DRIFT_CHECKPOINT" && app != null -> {
+                            DriftCheckpointScreen(
+                                blockedApp = app,
+                                onExtend = {
+                                    val prefs = getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE)
+                                    val now = System.currentTimeMillis()
+                                    prefs.edit()
+                                        .putLong("session_start_${app}", now)
+                                        .putBoolean("checkpoint_dismissed_${app}", true)
+                                        .apply()
+                                    launchTarget(app)
+                                },
+                                onClose = {
+                                    val prefs = getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE)
+                                    prefs.edit()
+                                        .putBoolean("session_authorized_${app}", false)
+                                        .remove("session_start_${app}")
+                                        .remove("checkpoint_dismissed_${app}")
+                                        .apply()
                                     moveTaskToBack(true)
                                 }
-                            }
-                        )
-                    } else {
-                        DashboardScreen()
+                            )
+                        }
+                        mode == "GATE_ENTRY" && app != null -> {
+                            TwoPhaseLockoutScreen(
+                                blockedApp = app,
+                                onComplete = {
+                                    startActiveSession(app)
+                                    launchTarget(app)
+                                }
+                            )
+                        }
+                        else -> {
+                            DashboardScreen()
+                        }
                     }
                 }
             }
@@ -99,33 +119,192 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         setIntent(intent)
-        extractIntentParams(intent)
+        parseIntentData(intent)
     }
 
-    private fun extractIntentParams(incomingIntent: Intent?) {
-        val app = incomingIntent?.getStringExtra("TRIGGERED_BY")
-        currentBlockedApp.value = app
-        val prefs = getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE)
-        if (app != null) {
-            activeEndTime.value = prefs.getLong("reading_end_time_${app}", 0L)
-        } else {
-            activeEndTime.value = 0L
-        }
-        triggerStamp.value = incomingIntent?.getLongExtra("TRIGGER_STAMP", System.currentTimeMillis()) ?: System.currentTimeMillis()
+    private fun parseIntentData(incoming: Intent?) {
+        currentBlockedApp.value = incoming?.getStringExtra("TRIGGERED_BY")
+        currentMode.value = incoming?.getStringExtra("MODE") ?: "DASHBOARD"
+        quarantineEnd.value = incoming?.getLongExtra("QUARANTINE_END", 0L) ?: 0L
     }
 
-    private fun clearLockoutTimers(packageName: String) {
+    private fun startActiveSession(packageName: String) {
         val prefs = getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE)
+        val now = System.currentTimeMillis()
         prefs.edit()
+            .putBoolean("session_authorized_${packageName}", true)
+            .putLong("session_start_${packageName}", now)
+            .putLong("session_last_active_${packageName}", now)
+            .putBoolean("checkpoint_dismissed_${packageName}", false)
             .remove("reading_end_time_${packageName}")
-            .remove("penalty_applied_${packageName}")
             .apply()
     }
 
-    private fun grantAccessPass(packageName: String, minutes: Int) {
-        val prefs = getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE)
-        val expiryTime = System.currentTimeMillis() + (minutes * 60 * 1000L)
-        prefs.edit().putLong("unlock_expiry_${packageName}", expiryTime).apply()
+    private fun launchTarget(packageName: String) {
+        currentBlockedApp.value = null
+        currentMode.value = "DASHBOARD"
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        if (launchIntent != null) {
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(launchIntent)
+        } else {
+            moveTaskToBack(true)
+        }
+    }
+}
+
+@Composable
+fun QuarantineScreen(blockedApp: String, endTime: Long, onExit: () -> Unit) {
+    BackHandler(enabled = true) { onExit() }
+
+    var remainingSeconds by remember(endTime) {
+        val now = System.currentTimeMillis()
+        mutableStateOf(if (endTime > now) (endTime - now) / 1000 else 0L)
+    }
+
+    DisposableEffect(endTime) {
+        val timer = object : CountDownTimer(remainingSeconds * 1000, 1000) {
+            override fun onTick(millis: Long) {
+                remainingSeconds = millis / 1000
+            }
+            override fun onFinish() {
+                remainingSeconds = 0
+            }
+        }.start()
+
+        onDispose { timer.cancel() }
+    }
+
+    val hours = remainingSeconds / 3600
+    val minutes = (remainingSeconds % 3600) / 60
+    val seconds = remainingSeconds % 60
+    val formattedTime = String.format(Locale.getDefault(), "%02d:%02d:%02d", hours, minutes, seconds)
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(28.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "QUARANTINE LOCK ACTIVE",
+            color = Color(0xFFEF4444),
+            fontSize = 20.sp,
+            fontWeight = FontWeight.Black
+        )
+        Spacer(modifier = Modifier.height(10.dp))
+        Text(
+            text = "Target $blockedApp has been hard-locked due to a boundary violation.",
+            color = Color(0xFF9CA3AF),
+            fontSize = 14.sp
+        )
+        Spacer(modifier = Modifier.height(36.dp))
+
+        Text(
+            text = formattedTime,
+            fontSize = 48.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = Color.White
+        )
+        Text(
+            text = "Mandatory Quarantine Remaining",
+            fontSize = 13.sp,
+            color = Color(0xFF6B7280)
+        )
+        Spacer(modifier = Modifier.height(36.dp))
+
+        Button(
+            onClick = onExit,
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E1E1E)),
+            shape = RoundedCornerShape(8.dp)
+        ) {
+            Text("Acknowledge & Exit to Home", color = Color.White)
+        }
+    }
+}
+
+@Composable
+fun DriftCheckpointScreen(blockedApp: String, onExtend: () -> Unit, onClose: () -> Unit) {
+    BackHandler(enabled = true) { onClose() }
+
+    var secondsLeft by remember { mutableStateOf(30L) }
+    var timerDone by remember { mutableStateOf(false) }
+
+    DisposableEffect(Unit) {
+        val timer = object : CountDownTimer(30_000, 1000) {
+            override fun onTick(millis: Long) {
+                secondsLeft = millis / 1000
+            }
+            override fun onFinish() {
+                timerDone = true
+                secondsLeft = 0
+            }
+        }.start()
+
+        onDispose { timer.cancel() }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(28.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "45-MINUTE DRIFT CHECKPOINT",
+            color = Color(0xFFF59E0B),
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        Text(
+            text = "You have maintained continuous active usage in $blockedApp for 45 minutes.\n\nTake a mandatory 30-second breath to evaluate: are you executing an intentional objective, or drifting into automated consumption?",
+            color = Color(0xFFD1D5DB),
+            fontSize = 14.sp,
+            lineHeight = 22.sp
+        )
+        Spacer(modifier = Modifier.height(28.dp))
+
+        Text(
+            text = "00:${String.format(Locale.getDefault(), "%02d", secondsLeft)}",
+            fontSize = 44.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = Color.White
+        )
+        Text(
+            text = "Breathing Anchor",
+            fontSize = 12.sp,
+            color = Color(0xFF6B7280)
+        )
+        Spacer(modifier = Modifier.height(32.dp))
+
+        Button(
+            onClick = onExtend,
+            enabled = timerDone,
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = Color(0xFF3B82F6),
+                disabledContainerColor = Color(0xFF262626)
+            ),
+            shape = RoundedCornerShape(8.dp)
+        ) {
+            Text(
+                text = if (timerDone) "Continue Task (45-Min Extension)" else "Reflect (${secondsLeft}s)",
+                color = if (timerDone) Color.White else Color(0xFF737373)
+            )
+        }
+        Spacer(modifier = Modifier.height(12.dp))
+
+        OutlinedButton(
+            onClick = onClose,
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+            shape = RoundedCornerShape(8.dp)
+        ) {
+            Text("Task Complete - Close App", color = Color(0xFF9CA3AF))
+        }
     }
 }
 
@@ -234,13 +413,13 @@ fun DashboardScreen() {
             ) {
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = "Select Target Apps to Intercept",
+                    text = "Adaptive Supervision Targets",
                     fontSize = 18.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = Color.White
                 )
                 Text(
-                    text = "Blocked targets enforce 3-min cooldowns with +5 min penalty on repeat attempts.",
+                    text = "Enforces 3-min entry gate, 10-min idle reset, 45-min drift checks, & 1-hr quarantine on breach.",
                     fontSize = 13.sp,
                     color = Color(0xFF9CA3AF)
                 )
@@ -300,12 +479,7 @@ fun DashboardScreen() {
 }
 
 @Composable
-fun TwoPhaseLockoutScreen(
-    blockedApp: String, 
-    endTime: Long, 
-    triggerStamp: Long,
-    onComplete: (Int, Boolean) -> Unit
-) {
+fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: () -> Unit) {
     BackHandler(enabled = true) { }
 
     val context = LocalContext.current
@@ -317,62 +491,50 @@ fun TwoPhaseLockoutScreen(
     when (currentPhase) {
         LockoutPhase.READING -> ReadingPhaseView(
             blockedApp = blockedApp,
-            endTime = endTime,
-            triggerStamp = triggerStamp,
             module = activeModule,
             onReadingComplete = { currentPhase = LockoutPhase.QUIZ }
         )
         LockoutPhase.QUIZ -> QuizPhaseView(
             module = activeModule,
-            onQuizPassed = { currentPhase = LockoutPhase.SUCCESS }
+            onQuizPassed = onComplete
         )
-        LockoutPhase.SUCCESS -> SuccessPhaseView(
-            blockedApp = blockedApp,
-            onDismiss = { grantMinutes, shouldLaunchTarget ->
-                onComplete(grantMinutes, shouldLaunchTarget)
-            }
-        )
+        LockoutPhase.SUCCESS -> {}
     }
 }
 
 @Composable
-fun ReadingPhaseView(
-    blockedApp: String,
-    endTime: Long,
-    triggerStamp: Long,
-    module: LearningModule,
-    onReadingComplete: () -> Unit
-) {
+fun ReadingPhaseView(blockedApp: String, module: LearningModule, onReadingComplete: () -> Unit) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE) }
+    val totalSeconds = 180L
 
-    val isPenaltyActive = remember(triggerStamp) {
-        prefs.getBoolean("penalty_applied_${blockedApp}", false)
-    }
-
-    var timeLeftSeconds by remember(triggerStamp) {
+    var timeLeftSeconds by remember(blockedApp) {
         val now = System.currentTimeMillis()
-        val remaining = if (endTime > now) (endTime - now) / 1000 else 0L
+        val storedEndTime = prefs.getLong("reading_end_time_${blockedApp}", 0L)
+        val remaining = if (storedEndTime > now) {
+            (storedEndTime - now) / 1000
+        } else {
+            val newEnd = now + (totalSeconds * 1000L)
+            prefs.edit().putLong("reading_end_time_${blockedApp}", newEnd).apply()
+            totalSeconds
+        }
         mutableStateOf(remaining)
     }
 
-    var isTimerFinished by remember(triggerStamp) { mutableStateOf(timeLeftSeconds <= 0) }
+    var isTimerFinished by remember(blockedApp) { mutableStateOf(timeLeftSeconds <= 0) }
 
-    DisposableEffect(triggerStamp) {
+    DisposableEffect(blockedApp) {
         val timer = object : CountDownTimer(timeLeftSeconds * 1000, 1000) {
-            override fun onTick(millisUntilFinished: Long) {
-                timeLeftSeconds = millisUntilFinished / 1000
+            override fun onTick(millis: Long) {
+                timeLeftSeconds = millis / 1000
             }
-
             override fun onFinish() {
                 isTimerFinished = true
                 timeLeftSeconds = 0
             }
         }.start()
 
-        onDispose {
-            timer.cancel()
-        }
+        onDispose { timer.cancel() }
     }
 
     val minutes = timeLeftSeconds / 60
@@ -388,7 +550,7 @@ fun ReadingPhaseView(
     ) {
         Spacer(modifier = Modifier.height(24.dp))
         Text(
-            text = if (isPenaltyActive) "PENALTY SURCHARGE APPLIED (+5 MIN)" else "PHASE 1: COGNITIVE RESET",
+            text = "GATE 1: COGNITIVE RESET",
             color = Color(0xFFEF4444),
             fontSize = 13.sp,
             fontWeight = FontWeight.Bold
@@ -408,9 +570,9 @@ fun ReadingPhaseView(
             color = Color.White
         )
         Text(
-            text = if (isPenaltyActive) "Bypass Surcharge Active" else "Mandatory Cooldown Buffer",
+            text = "Mandatory 3-Minute Reset",
             fontSize = 13.sp,
-            color = if (isPenaltyActive) Color(0xFFEF4444) else Color(0xFF6B7280)
+            color = Color(0xFF6B7280)
         )
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -452,7 +614,7 @@ fun ReadingPhaseView(
             shape = RoundedCornerShape(8.dp)
         ) {
             Text(
-                text = if (isTimerFinished) "Start Assessment Quiz" else "Cooldown Active ($formattedTime)",
+                text = if (isTimerFinished) "Start Assessment Quiz" else "Reading Active ($formattedTime)",
                 color = if (isTimerFinished) Color.White else Color(0xFF737373),
                 fontWeight = FontWeight.SemiBold
             )
@@ -468,18 +630,15 @@ fun QuizPhaseView(module: LearningModule, onQuizPassed: () -> Unit) {
 
     DisposableEffect(Unit) {
         val timer = object : CountDownTimer(timeLeftSeconds * 1000, 1000) {
-            override fun onTick(millisUntilFinished: Long) {
-                timeLeftSeconds = millisUntilFinished / 1000
+            override fun onTick(millis: Long) {
+                timeLeftSeconds = millis / 1000
             }
-
             override fun onFinish() {
                 timeLeftSeconds = 0
             }
         }.start()
 
-        onDispose {
-            timer.cancel()
-        }
+        onDispose { timer.cancel() }
     }
 
     val minutes = timeLeftSeconds / 60
@@ -495,7 +654,7 @@ fun QuizPhaseView(module: LearningModule, onQuizPassed: () -> Unit) {
     ) {
         Spacer(modifier = Modifier.height(24.dp))
         Text(
-            text = "PHASE 2: ASSESSMENT QUIZ",
+            text = "ASSESSMENT COMPREHENSION",
             color = Color(0xFFF59E0B),
             fontSize = 13.sp,
             fontWeight = FontWeight.Bold
@@ -581,54 +740,10 @@ fun QuizPhaseView(module: LearningModule, onQuizPassed: () -> Unit) {
             shape = RoundedCornerShape(8.dp)
         ) {
             Text(
-                text = "Submit Answer",
+                text = "Authorize Session",
                 color = if (selectedOption != null) Color.White else Color(0xFF737373),
                 fontWeight = FontWeight.SemiBold
             )
-        }
-    }
-}
-
-@Composable
-fun SuccessPhaseView(blockedApp: String, onDismiss: (Int, Boolean) -> Unit) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text(
-            text = "Threshold Completed",
-            fontSize = 26.sp,
-            fontWeight = FontWeight.Bold,
-            color = Color(0xFF10B981)
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            text = "Cognitive engagement verified. Choose how you wish to proceed.",
-            color = Color(0xFFB0B0B0),
-            fontSize = 14.sp
-        )
-        Spacer(modifier = Modifier.height(28.dp))
-
-        Button(
-            onClick = { onDismiss(10, true) },
-            modifier = Modifier.fillMaxWidth().height(50.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3B82F6)),
-            shape = RoundedCornerShape(8.dp)
-        ) {
-            Text(text = "Launch Target App (10 Min Access)", color = Color.White, fontWeight = FontWeight.SemiBold)
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        OutlinedButton(
-            onClick = { onDismiss(0, false) },
-            modifier = Modifier.fillMaxWidth().height(50.dp),
-            shape = RoundedCornerShape(8.dp)
-        ) {
-            Text(text = "Exit to Home (Keep App Locked)", color = Color(0xFF9CA3AF))
         }
     }
 }
