@@ -51,13 +51,12 @@ enum class LockoutPhase { READING, QUIZ, SUCCESS }
 class MainActivity : ComponentActivity() {
 
     private val currentBlockedApp = mutableStateOf<String?>(null)
-    private val sessionKey = mutableStateOf(0L)
+    private val activeEndTime = mutableStateOf(0L)
+    private val triggerStamp = mutableStateOf(0L)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val target = intent.getStringExtra("TRIGGERED_BY")
-        currentBlockedApp.value = target
-        sessionKey.value = intent.getLongExtra("SESSION_TRIGGER_TIME", System.currentTimeMillis())
+        extractIntentParams(intent)
 
         setContent {
             FocusForgeTheme {
@@ -69,7 +68,8 @@ class MainActivity : ComponentActivity() {
                     if (blockedApp != null) {
                         TwoPhaseLockoutScreen(
                             blockedApp = blockedApp,
-                            sessionKey = sessionKey.value,
+                            endTime = activeEndTime.value,
+                            triggerStamp = triggerStamp.value,
                             onComplete = { grantWindowMinutes, shouldLaunchTarget ->
                                 grantAccessPass(blockedApp, grantWindowMinutes)
                                 clearLockoutTimers(blockedApp)
@@ -99,8 +99,19 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         setIntent(intent)
-        currentBlockedApp.value = intent?.getStringExtra("TRIGGERED_BY")
-        sessionKey.value = intent?.getLongExtra("SESSION_TRIGGER_TIME", System.currentTimeMillis()) ?: System.currentTimeMillis()
+        extractIntentParams(intent)
+    }
+
+    private fun extractIntentParams(incomingIntent: Intent?) {
+        val app = incomingIntent?.getStringExtra("TRIGGERED_BY")
+        currentBlockedApp.value = app
+        val prefs = getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE)
+        if (app != null) {
+            activeEndTime.value = prefs.getLong("reading_end_time_${app}", 0L)
+        } else {
+            activeEndTime.value = 0L
+        }
+        triggerStamp.value = incomingIntent?.getLongExtra("TRIGGER_STAMP", System.currentTimeMillis()) ?: System.currentTimeMillis()
     }
 
     private fun clearLockoutTimers(packageName: String) {
@@ -229,7 +240,7 @@ fun DashboardScreen() {
                     color = Color.White
                 )
                 Text(
-                    text = "Toggled apps enforce 3-min cooldowns with +5 min penalty on repeat attempts.",
+                    text = "Blocked targets enforce 3-min cooldowns with +5 min penalty on repeat attempts.",
                     fontSize = 13.sp,
                     color = Color(0xFF9CA3AF)
                 )
@@ -289,19 +300,25 @@ fun DashboardScreen() {
 }
 
 @Composable
-fun TwoPhaseLockoutScreen(blockedApp: String, sessionKey: Long, onComplete: (Int, Boolean) -> Unit) {
+fun TwoPhaseLockoutScreen(
+    blockedApp: String, 
+    endTime: Long, 
+    triggerStamp: Long,
+    onComplete: (Int, Boolean) -> Unit
+) {
     BackHandler(enabled = true) { }
 
     val context = LocalContext.current
     val modules = remember { loadLearningModules(context) }
-    val activeModule = remember(sessionKey) { modules.random() }
+    val activeModule = remember(blockedApp) { modules.random() }
 
     var currentPhase by remember { mutableStateOf(LockoutPhase.READING) }
 
     when (currentPhase) {
         LockoutPhase.READING -> ReadingPhaseView(
             blockedApp = blockedApp,
-            sessionKey = sessionKey,
+            endTime = endTime,
+            triggerStamp = triggerStamp,
             module = activeModule,
             onReadingComplete = { currentPhase = LockoutPhase.QUIZ }
         )
@@ -319,24 +336,29 @@ fun TwoPhaseLockoutScreen(blockedApp: String, sessionKey: Long, onComplete: (Int
 }
 
 @Composable
-fun ReadingPhaseView(blockedApp: String, sessionKey: Long, module: LearningModule, onReadingComplete: () -> Unit) {
+fun ReadingPhaseView(
+    blockedApp: String,
+    endTime: Long,
+    triggerStamp: Long,
+    module: LearningModule,
+    onReadingComplete: () -> Unit
+) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE) }
 
-    var isPenaltyActive by remember(sessionKey) {
-        mutableStateOf(prefs.getBoolean("penalty_applied_${blockedApp}", false))
+    val isPenaltyActive = remember(triggerStamp) {
+        prefs.getBoolean("penalty_applied_${blockedApp}", false)
     }
 
-    var timeLeftSeconds by remember(sessionKey) {
-        val storedEndTime = prefs.getLong("reading_end_time_${blockedApp}", 0L)
-        val currentTime = System.currentTimeMillis()
-        val remaining = if (storedEndTime > currentTime) (storedEndTime - currentTime) / 1000 else 0L
+    var timeLeftSeconds by remember(triggerStamp) {
+        val now = System.currentTimeMillis()
+        val remaining = if (endTime > now) (endTime - now) / 1000 else 0L
         mutableStateOf(remaining)
     }
 
-    var isTimerFinished by remember(sessionKey) { mutableStateOf(timeLeftSeconds <= 0) }
+    var isTimerFinished by remember(triggerStamp) { mutableStateOf(timeLeftSeconds <= 0) }
 
-    DisposableEffect(sessionKey) {
+    DisposableEffect(triggerStamp) {
         val timer = object : CountDownTimer(timeLeftSeconds * 1000, 1000) {
             override fun onTick(millisUntilFinished: Long) {
                 timeLeftSeconds = millisUntilFinished / 1000
@@ -386,7 +408,7 @@ fun ReadingPhaseView(blockedApp: String, sessionKey: Long, module: LearningModul
             color = Color.White
         )
         Text(
-            text = if (isPenaltyActive) "Bypass Detected - Surcharge Active" else "Mandatory Cooldown Buffer",
+            text = if (isPenaltyActive) "Bypass Surcharge Active" else "Mandatory Cooldown Buffer",
             fontSize = 13.sp,
             color = if (isPenaltyActive) Color(0xFFEF4444) else Color(0xFF6B7280)
         )
