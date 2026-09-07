@@ -2,7 +2,6 @@ package com.focusforge.app
 
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.CountDownTimer
@@ -359,24 +358,42 @@ fun DashboardScreen() {
 
     LaunchedEffect(Unit) {
         val pm = context.packageManager
-        val packages = pm.getInstalledApplications(PackageManager.GET_META_DATA)
+        val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+            addCategory(Intent.CATEGORY_LAUNCHER)
+        }
+        val resolveInfos = pm.queryIntentActivities(mainIntent, 0)
         val savedBlocked = prefs.getStringSet("blocked_packages_set", setOf("com.android.chrome")) ?: emptySet()
 
-        val appList = packages.filter { app ->
-            app.packageName != context.packageName &&
-            ((app.flags and ApplicationInfo.FLAG_SYSTEM) == 0 ||
-             app.packageName == "com.android.chrome" ||
-             app.packageName.contains("youtube") ||
-             app.packageName.contains("browser"))
-        }.map { app ->
-            InstalledApp(
-                appName = pm.getApplicationLabel(app).toString(),
-                packageName = app.packageName,
-                isBlocked = savedBlocked.contains(app.packageName)
-            )
-        }.sortedBy { it.appName.lowercase(Locale.getDefault()) }
+        val seenPackages = mutableSetOf<String>()
+        val appList = mutableListOf<InstalledApp>()
 
-        installedApps = appList
+        for (info in resolveInfos) {
+            val pkg = info.activityInfo.packageName
+            if (pkg != context.packageName && !seenPackages.contains(pkg)) {
+                seenPackages.add(pkg)
+                val label = info.loadLabel(pm).toString()
+                appList.add(
+                    InstalledApp(
+                        appName = label,
+                        packageName = pkg,
+                        isBlocked = savedBlocked.contains(pkg)
+                    )
+                )
+            }
+        }
+
+        // Always guarantee Chrome is in the list even if not picked up by launcher query
+        if (!seenPackages.contains("com.android.chrome")) {
+            appList.add(
+                InstalledApp(
+                    appName = "Google Chrome",
+                    packageName = "com.android.chrome",
+                    isBlocked = savedBlocked.contains("com.android.chrome")
+                )
+            )
+        }
+
+        installedApps = appList.sortedBy { it.appName.lowercase(Locale.getDefault()) }
         isLoading = false
     }
 
@@ -506,14 +523,13 @@ fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: () -> Unit) {
 fun ReadingPhaseView(blockedApp: String, module: LearningModule, onReadingComplete: () -> Unit) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE) }
-    val maxAllowedSeconds = 180L // Strict 3-minute cap
+    val maxAllowedSeconds = 180L
 
     var timeLeftSeconds by remember(blockedApp) {
         val now = System.currentTimeMillis()
         val storedEndTime = prefs.getLong("reading_end_time_${blockedApp}", 0L)
         val calculatedRemaining = (storedEndTime - now) / 1000
 
-        // Strict validation: reject any value outside 1..180s and force 180s
         val safeRemaining = if (calculatedRemaining in 1..maxAllowedSeconds) {
             calculatedRemaining
         } else {
