@@ -506,19 +506,22 @@ fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: () -> Unit) {
 fun ReadingPhaseView(blockedApp: String, module: LearningModule, onReadingComplete: () -> Unit) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE) }
-    val totalSeconds = 180L
+    val maxAllowedSeconds = 180L // Strict 3-minute cap
 
     var timeLeftSeconds by remember(blockedApp) {
         val now = System.currentTimeMillis()
         val storedEndTime = prefs.getLong("reading_end_time_${blockedApp}", 0L)
-        val remaining = if (storedEndTime > now) {
-            (storedEndTime - now) / 1000
+        val calculatedRemaining = (storedEndTime - now) / 1000
+
+        // Strict validation: reject any value outside 1..180s and force 180s
+        val safeRemaining = if (calculatedRemaining in 1..maxAllowedSeconds) {
+            calculatedRemaining
         } else {
-            val newEnd = now + (totalSeconds * 1000L)
-            prefs.edit().putLong("reading_end_time_${blockedApp}", newEnd).apply()
-            totalSeconds
+            val freshEnd = now + (maxAllowedSeconds * 1000L)
+            prefs.edit().putLong("reading_end_time_${blockedApp}", freshEnd).apply()
+            maxAllowedSeconds
         }
-        mutableStateOf(remaining)
+        mutableStateOf(safeRemaining)
     }
 
     var isTimerFinished by remember(blockedApp) { mutableStateOf(timeLeftSeconds <= 0) }
