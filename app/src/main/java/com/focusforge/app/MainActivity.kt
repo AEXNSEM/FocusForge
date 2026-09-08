@@ -30,6 +30,12 @@ import java.util.Locale
 
 private const val PREFS_NAME = "focus_forge_prefs"
 
+// Gate 1 reading cooldown + Home-Bypass Surcharge tuning.
+private const val BASE_READING_MS = 180_000L          // 3-minute mandatory reset
+private const val BYPASS_SURCHARGE_FIRST_MS = 5 * 60_000L   // +5 min on the 1st bypass
+private const val BYPASS_SURCHARGE_REPEAT_MS = 10 * 60_000L // +10 min on each bypass after that
+private const val MAX_COUNTED_BYPASS_ATTEMPTS = 3      // worst case: 3 + 5 + 10 + 10 = 28 min
+
 data class LearningModule(
     val id: String,
     val topic: String,
@@ -67,6 +73,12 @@ class MainActivity : ComponentActivity() {
 
     private var screenState by mutableStateOf<ScreenState>(ScreenState.Dashboard)
 
+    // True only while the Gate 1 reading countdown is mounted AND still running (not
+    // the quiz phase, and not once the countdown has already hit zero). Reported up by
+    // ReadingPhaseView. onStop() reads this to tell a genuine home-bypass apart from the
+    // legitimate backgrounding that happens when we launch the now-authorized target app.
+    private var readingCooldownActive by mutableStateOf(false)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         screenState = computeScreenState(intent)
@@ -95,6 +107,7 @@ class MainActivity : ComponentActivity() {
                         is ScreenState.GateEntry -> {
                             TwoPhaseLockoutScreen(
                                 blockedApp = state.targetPackage,
+                                onReadingCooldownActiveChange = { active -> readingCooldownActive = active },
                                 onComplete = {
                                     startActiveSession(state.targetPackage)
                                     launchTarget(state.targetPackage)
@@ -114,6 +127,42 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         screenState = computeScreenState(intent)
+    }
+
+    /**
+     * Home-Bypass Surcharge. onStop() fires for every reason the Activity leaves the
+     * foreground — home press, recent-apps switch, screen lock, or us legitimately
+     * starting the target app. We only charge a surcharge when readingCooldownActive is
+     * still true at that moment, which is false by the time the legitimate path runs
+     * (launchTarget() flips screenState to Dashboard, which unmounts ReadingPhaseView
+     * and reports cooldown-inactive, before startActivity() is ever called).
+     */
+    override fun onStop() {
+        super.onStop()
+        val state = screenState
+        if (readingCooldownActive && state is ScreenState.GateEntry) {
+            recordBypassAttempt(state.targetPackage)
+        }
+    }
+
+    private fun recordBypassAttempt(packageName: String) {
+        val prefs = prefs()
+        val attemptsSoFar = prefs.getInt("reading_bypass_count_$packageName", 0)
+        if (attemptsSoFar >= MAX_COUNTED_BYPASS_ATTEMPTS) return // cap reached, no further surcharge
+
+        val surcharge = if (attemptsSoFar == 0) BYPASS_SURCHARGE_FIRST_MS else BYPASS_SURCHARGE_REPEAT_MS
+        val now = System.currentTimeMillis()
+        val currentEnd = prefs.getLong("reading_end_time_$packageName", now)
+        val currentCeiling = prefs.getLong("reading_ceiling_ms_$packageName", BASE_READING_MS)
+
+        // commit() (synchronous), not apply(): this is an enforcement write made right as
+        // the process is about to be backgrounded (and possibly reclaimed), so it needs
+        // to hit disk before onStop() returns rather than relying on an async flush.
+        prefs.edit()
+            .putLong("reading_end_time_$packageName", maxOf(currentEnd, now) + surcharge)
+            .putLong("reading_ceiling_ms_$packageName", currentCeiling + surcharge)
+            .putInt("reading_bypass_count_$packageName", attemptsSoFar + 1)
+            .commit()
     }
 
     private fun computeScreenState(incoming: Intent?): ScreenState {
@@ -140,6 +189,8 @@ class MainActivity : ComponentActivity() {
             .putLong("session_last_active_$packageName", now)
             .putBoolean("checkpoint_dismissed_$packageName", false)
             .remove("reading_end_time_$packageName")
+            .remove("reading_ceiling_ms_$packageName")
+            .remove("reading_bypass_count_$packageName")
             .apply()
     }
 
@@ -527,7 +578,11 @@ fun DashboardScreen() {
 }
 
 @Composable
-fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: () -> Unit) {
+fun TwoPhaseLockoutScreen(
+    blockedApp: String,
+    onReadingCooldownActiveChange: (Boolean) -> Unit,
+    onComplete: () -> Unit
+) {
     BackHandler(enabled = true) { }
 
     val context = LocalContext.current
@@ -540,6 +595,7 @@ fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: () -> Unit) {
         LockoutPhase.READING -> ReadingPhaseView(
             blockedApp = blockedApp,
             module = activeModule,
+            onCooldownActiveChange = onReadingCooldownActiveChange,
             onReadingComplete = { currentPhase = LockoutPhase.QUIZ }
         )
         LockoutPhase.QUIZ -> QuizPhaseView(
@@ -551,27 +607,56 @@ fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: () -> Unit) {
 }
 
 @Composable
-fun ReadingPhaseView(blockedApp: String, module: LearningModule, onReadingComplete: () -> Unit) {
+fun ReadingPhaseView(
+    blockedApp: String,
+    module: LearningModule,
+    onCooldownActiveChange: (Boolean) -> Unit,
+    onReadingComplete: () -> Unit
+) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
-    val maxAllowedSeconds = 180L
 
+    // The ceiling isn't a fixed 180s anymore: it grows by the surcharge amount every
+    // time recordBypassAttempt() fires, so a resumed countdown that's legitimately
+    // longer than the base 3 minutes (because of a prior bypass) isn't mistaken for
+    // stale/tampered data and reset back down to base.
     var timeLeftSeconds by remember(blockedApp) {
         val now = System.currentTimeMillis()
+        val ceilingMs = prefs.getLong("reading_ceiling_ms_$blockedApp", BASE_READING_MS)
         val storedEndTime = prefs.getLong("reading_end_time_$blockedApp", 0L)
-        val calculatedRemaining = (storedEndTime - now) / 1000
+        val calculatedRemainingMs = storedEndTime - now
 
-        val safeRemaining = if (calculatedRemaining in 1..maxAllowedSeconds) {
-            calculatedRemaining
+        val safeRemainingSeconds = if (calculatedRemainingMs in 1..ceilingMs) {
+            calculatedRemainingMs / 1000
         } else {
-            val freshEnd = now + (maxAllowedSeconds * 1000L)
-            prefs.edit().putLong("reading_end_time_$blockedApp", freshEnd).apply()
-            maxAllowedSeconds
+            // No valid in-flight countdown: first entry into this gate, or the stored
+            // value is stale/outside the current ceiling. Start clean, including
+            // resetting the bypass penalty state for this fresh attempt.
+            val freshEnd = now + BASE_READING_MS
+            prefs.edit()
+                .putLong("reading_end_time_$blockedApp", freshEnd)
+                .putLong("reading_ceiling_ms_$blockedApp", BASE_READING_MS)
+                .putInt("reading_bypass_count_$blockedApp", 0)
+                .apply()
+            BASE_READING_MS / 1000
         }
-        mutableStateOf(safeRemaining)
+        mutableStateOf(safeRemainingSeconds)
     }
 
+    val bypassCount = remember(blockedApp) { prefs.getInt("reading_bypass_count_$blockedApp", 0) }
+
     var isTimerFinished by remember(blockedApp) { mutableStateOf(timeLeftSeconds <= 0) }
+
+    // Reports cooldown-active up to MainActivity for the whole time this composable is
+    // mounted with an unfinished timer, and flips off the instant the countdown hits
+    // zero — a bypass attempt after that point doesn't re-penalize an already-cleared gate.
+    DisposableEffect(blockedApp) {
+        onCooldownActiveChange(!isTimerFinished)
+        onDispose { onCooldownActiveChange(false) }
+    }
+    LaunchedEffect(isTimerFinished) {
+        if (isTimerFinished) onCooldownActiveChange(false)
+    }
 
     DisposableEffect(blockedApp) {
         val timer = object : CountDownTimer((timeLeftSeconds * 1000).coerceAtLeast(1_000L), 1000) {
@@ -624,6 +709,15 @@ fun ReadingPhaseView(blockedApp: String, module: LearningModule, onReadingComple
             fontSize = 13.sp,
             color = Color(0xFF6B7280)
         )
+        if (bypassCount > 0) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "Cooldown extended — $bypassCount home-bypass attempt${if (bypassCount == 1) "" else "s"} detected",
+                fontSize = 12.sp,
+                color = Color(0xFFEF4444),
+                fontWeight = FontWeight.Medium
+            )
+        }
 
         Spacer(modifier = Modifier.height(24.dp))
 
