@@ -2,7 +2,6 @@ package com.focusforge.app
 
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.CountDownTimer
 import android.provider.Settings
@@ -29,6 +28,8 @@ import androidx.compose.ui.unit.sp
 import org.json.JSONArray
 import java.util.Locale
 
+private const val PREFS_NAME = "focus_forge_prefs"
+
 data class LearningModule(
     val id: String,
     val topic: String,
@@ -47,15 +48,28 @@ data class InstalledApp(
 
 enum class LockoutPhase { READING, QUIZ, SUCCESS }
 
+/**
+ * Everything MainActivity can be showing, derived atomically from a single Intent.
+ * Replaces three independently-mutable fields (blockedApp / mode / quarantineEnd) with
+ * one value so a recomposition can never observe a torn combination of them (e.g. a new
+ * target package paired with the previous screen's mode) — which matters here because
+ * the accessibility service can redeliver an intent to this singleTop activity very
+ * frequently (every 1.5s while a gate is unresolved).
+ */
+sealed class ScreenState {
+    object Dashboard : ScreenState()
+    data class GateEntry(val targetPackage: String) : ScreenState()
+    data class DriftCheckpoint(val targetPackage: String) : ScreenState()
+    data class QuarantineHammer(val targetPackage: String, val quarantineEnd: Long) : ScreenState()
+}
+
 class MainActivity : ComponentActivity() {
 
-    private val currentBlockedApp = mutableStateOf<String?>(null)
-    private val currentMode = mutableStateOf<String?>("DASHBOARD")
-    private val quarantineEnd = mutableStateOf(0L)
+    private var screenState by mutableStateOf<ScreenState>(ScreenState.Dashboard)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        parseIntentData(intent)
+        screenState = computeScreenState(intent)
 
         setContent {
             FocusForgeTheme {
@@ -63,50 +77,31 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     color = Color(0xFF121212)
                 ) {
-                    val app = currentBlockedApp.value
-                    val mode = currentMode.value
-
-                    when {
-                        mode == "QUARANTINE_HAMMER" && app != null -> {
+                    when (val state = screenState) {
+                        is ScreenState.QuarantineHammer -> {
                             QuarantineScreen(
-                                blockedApp = app,
-                                endTime = quarantineEnd.value,
+                                blockedApp = state.targetPackage,
+                                endTime = state.quarantineEnd,
                                 onExit = { moveTaskToBack(true) }
                             )
                         }
-                        mode == "DRIFT_CHECKPOINT" && app != null -> {
+                        is ScreenState.DriftCheckpoint -> {
                             DriftCheckpointScreen(
-                                blockedApp = app,
-                                onExtend = {
-                                    val prefs = getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE)
-                                    val now = System.currentTimeMillis()
-                                    prefs.edit()
-                                        .putLong("session_start_${app}", now)
-                                        .putBoolean("checkpoint_dismissed_${app}", true)
-                                        .apply()
-                                    launchTarget(app)
-                                },
-                                onClose = {
-                                    val prefs = getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE)
-                                    prefs.edit()
-                                        .putBoolean("session_authorized_${app}", false)
-                                        .remove("session_start_${app}")
-                                        .remove("checkpoint_dismissed_${app}")
-                                        .apply()
-                                    moveTaskToBack(true)
-                                }
+                                blockedApp = state.targetPackage,
+                                onExtend = { extendSession(state.targetPackage) },
+                                onClose = { endSession(state.targetPackage) }
                             )
                         }
-                        mode == "GATE_ENTRY" && app != null -> {
+                        is ScreenState.GateEntry -> {
                             TwoPhaseLockoutScreen(
-                                blockedApp = app,
+                                blockedApp = state.targetPackage,
                                 onComplete = {
-                                    startActiveSession(app)
-                                    launchTarget(app)
+                                    startActiveSession(state.targetPackage)
+                                    launchTarget(state.targetPackage)
                                 }
                             )
                         }
-                        else -> {
+                        ScreenState.Dashboard -> {
                             DashboardScreen()
                         }
                     }
@@ -118,30 +113,66 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         setIntent(intent)
-        parseIntentData(intent)
+        screenState = computeScreenState(intent)
     }
 
-    private fun parseIntentData(incoming: Intent?) {
-        currentBlockedApp.value = incoming?.getStringExtra("TRIGGERED_BY")
-        currentMode.value = incoming?.getStringExtra("MODE") ?: "DASHBOARD"
-        quarantineEnd.value = incoming?.getLongExtra("QUARANTINE_END", 0L) ?: 0L
+    private fun computeScreenState(incoming: Intent?): ScreenState {
+        val target = incoming?.getStringExtra(EXTRA_TRIGGERED_BY)
+        val mode = incoming?.getStringExtra(EXTRA_MODE)
+        return when {
+            mode == MODE_QUARANTINE_HAMMER && target != null ->
+                ScreenState.QuarantineHammer(target, incoming.getLongExtra(EXTRA_QUARANTINE_END, 0L))
+            mode == MODE_DRIFT_CHECKPOINT && target != null ->
+                ScreenState.DriftCheckpoint(target)
+            mode == MODE_GATE_ENTRY && target != null ->
+                ScreenState.GateEntry(target)
+            else -> ScreenState.Dashboard
+        }
     }
+
+    private fun prefs() = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     private fun startActiveSession(packageName: String) {
-        val prefs = getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE)
         val now = System.currentTimeMillis()
-        prefs.edit()
-            .putBoolean("session_authorized_${packageName}", true)
-            .putLong("session_start_${packageName}", now)
-            .putLong("session_last_active_${packageName}", now)
-            .putBoolean("checkpoint_dismissed_${packageName}", false)
-            .remove("reading_end_time_${packageName}")
+        prefs().edit()
+            .putBoolean("session_authorized_$packageName", true)
+            .putLong("session_start_$packageName", now)
+            .putLong("session_last_active_$packageName", now)
+            .putBoolean("checkpoint_dismissed_$packageName", false)
+            .remove("reading_end_time_$packageName")
             .apply()
     }
 
+    /**
+     * Bug fix: the original code set checkpoint_dismissed_$app = TRUE here, which is
+     * inverted — that flag is what SUPPRESSES the drift checkpoint. Since it was never
+     * cleared anywhere else in the "extend" path, the very first 45-minute checkpoint a
+     * user ever saw would permanently disable all future ones for that trust chain
+     * (session_start already resets continuousDuration to ~0 on extend, so there was
+     * never a need to also suppress the flag — that's what caused the feature to fire
+     * once and then silently stop working).
+     */
+    private fun extendSession(packageName: String) {
+        val now = System.currentTimeMillis()
+        prefs().edit()
+            .putLong("session_start_$packageName", now)
+            .putLong("session_last_active_$packageName", now)
+            .putBoolean("checkpoint_dismissed_$packageName", false)
+            .apply()
+        launchTarget(packageName)
+    }
+
+    private fun endSession(packageName: String) {
+        prefs().edit()
+            .putBoolean("session_authorized_$packageName", false)
+            .remove("session_start_$packageName")
+            .remove("checkpoint_dismissed_$packageName")
+            .apply()
+        moveTaskToBack(true)
+    }
+
     private fun launchTarget(packageName: String) {
-        currentBlockedApp.value = null
-        currentMode.value = "DASHBOARD"
+        screenState = ScreenState.Dashboard
         val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
         if (launchIntent != null) {
             launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -162,7 +193,7 @@ fun QuarantineScreen(blockedApp: String, endTime: Long, onExit: () -> Unit) {
     }
 
     DisposableEffect(endTime) {
-        val timer = object : CountDownTimer(remainingSeconds * 1000, 1000) {
+        val timer = object : CountDownTimer((remainingSeconds * 1000).coerceAtLeast(1_000L), 1000) {
             override fun onTick(millis: Long) {
                 remainingSeconds = millis / 1000
             }
@@ -351,7 +382,7 @@ fun loadLearningModules(context: Context): List<LearningModule> {
 @Composable
 fun DashboardScreen() {
     val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE) }
+    val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
 
     var installedApps by remember { mutableStateOf<List<InstalledApp>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
@@ -522,19 +553,19 @@ fun TwoPhaseLockoutScreen(blockedApp: String, onComplete: () -> Unit) {
 @Composable
 fun ReadingPhaseView(blockedApp: String, module: LearningModule, onReadingComplete: () -> Unit) {
     val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences("focus_forge_prefs", Context.MODE_PRIVATE) }
+    val prefs = remember { context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE) }
     val maxAllowedSeconds = 180L
 
     var timeLeftSeconds by remember(blockedApp) {
         val now = System.currentTimeMillis()
-        val storedEndTime = prefs.getLong("reading_end_time_${blockedApp}", 0L)
+        val storedEndTime = prefs.getLong("reading_end_time_$blockedApp", 0L)
         val calculatedRemaining = (storedEndTime - now) / 1000
 
         val safeRemaining = if (calculatedRemaining in 1..maxAllowedSeconds) {
             calculatedRemaining
         } else {
             val freshEnd = now + (maxAllowedSeconds * 1000L)
-            prefs.edit().putLong("reading_end_time_${blockedApp}", freshEnd).apply()
+            prefs.edit().putLong("reading_end_time_$blockedApp", freshEnd).apply()
             maxAllowedSeconds
         }
         mutableStateOf(safeRemaining)
@@ -543,7 +574,7 @@ fun ReadingPhaseView(blockedApp: String, module: LearningModule, onReadingComple
     var isTimerFinished by remember(blockedApp) { mutableStateOf(timeLeftSeconds <= 0) }
 
     DisposableEffect(blockedApp) {
-        val timer = object : CountDownTimer(timeLeftSeconds * 1000, 1000) {
+        val timer = object : CountDownTimer((timeLeftSeconds * 1000).coerceAtLeast(1_000L), 1000) {
             override fun onTick(millis: Long) {
                 timeLeftSeconds = millis / 1000
             }
