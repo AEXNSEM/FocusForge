@@ -1,33 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools">
+    package="com.focusforge.app">
 
-    <!-- Grants visibility to query installed applications on Android 11+ -->
+    <!-- Lets the Dashboard enumerate launcher apps via queryIntentActivities(); this is
+         one of the exemptions Android's package-visibility rules already grant for
+         CATEGORY_LAUNCHER queries, declared explicitly for clarity. -->
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
-        </intent>
-        <intent>
-            <action android:name="android.intent.action.VIEW" />
-            <data android:scheme="https" />
+            <category android:name="android.intent.category.LAUNCHER" />
         </intent>
     </queries>
 
     <application
         android:allowBackup="false"
-        android:fullBackupContent="false"
-        android:dataExtractionRules="@null"
-        android:icon="@android:drawable/sym_def_app_icon"
         android:label="FocusForge"
-        android:supportsRtl="true"
-        android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
-        tools:replace="android:allowBackup">
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.FocusForge">
 
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
-            android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+            android:excludeFromRecents="true"
+            android:theme="@style/Theme.FocusForge">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -36,8 +32,8 @@
 
         <service
             android:name=".FocusAccessibilityService"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="true">
+            android:exported="false"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />
             </intent-filter>
@@ -47,5 +43,4 @@
         </service>
 
     </application>
-
 </manifest>
