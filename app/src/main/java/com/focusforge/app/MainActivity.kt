@@ -30,7 +30,9 @@ import java.util.Locale
 
 private const val PREFS_NAME = "focus_forge_prefs"
 
-// Gate 1 reading cooldown + Home-Bypass Surcharge tuning.
+// Gate 1 reading cooldown + Home-Bypass Surcharge tuning. This track is completely
+// separate from Progressive Drift Escalation and from the Trapwire Quarantine Hammer —
+// it only ever adds minutes to the Gate 1 reading countdown, never triggers a lock.
 private const val BASE_READING_MS = 180_000L          // 3-minute mandatory reset
 private const val BYPASS_SURCHARGE_FIRST_MS = 5 * 60_000L   // +5 min on the 1st bypass
 private const val BYPASS_SURCHARGE_REPEAT_MS = 10 * 60_000L // +10 min on each bypass after that
@@ -53,19 +55,27 @@ data class InstalledApp(
 )
 
 enum class LockoutPhase { READING, QUIZ, SUCCESS }
+enum class ReverificationPhase { ANCHOR, QUIZ }
 
 /**
  * Everything MainActivity can be showing, derived atomically from a single Intent.
- * Replaces three independently-mutable fields (blockedApp / mode / quarantineEnd) with
- * one value so a recomposition can never observe a torn combination of them (e.g. a new
- * target package paired with the previous screen's mode) — which matters here because
- * the accessibility service can redeliver an intent to this singleTop activity very
+ * One value rather than several independently-mutable fields, so a recomposition can
+ * never observe a torn combination of them — which matters here because the
+ * accessibility service can redeliver an intent to this singleTop activity very
  * frequently (every 1.5s while a gate is unresolved).
+ *
+ * DriftCheckpoint carries a `level` (1 = 45-min Intent Anchor, 2 = 90-min pause +
+ * re-verification quiz). DriftCoolOff (level 3, 135 min) is its own case with its own
+ * screen — deliberately not merged into QuarantineHammer, even though both are
+ * "lock screens with a countdown": one is an overuse cool-off, the other is a
+ * content-violation lock, and conflating them would blur the exact distinction the
+ * app is built around.
  */
 sealed class ScreenState {
     object Dashboard : ScreenState()
     data class GateEntry(val targetPackage: String) : ScreenState()
-    data class DriftCheckpoint(val targetPackage: String) : ScreenState()
+    data class DriftCheckpoint(val targetPackage: String, val level: Int) : ScreenState()
+    data class DriftCoolOff(val targetPackage: String, val coolOffEnd: Long) : ScreenState()
     data class QuarantineHammer(val targetPackage: String, val quarantineEnd: Long) : ScreenState()
 }
 
@@ -104,12 +114,27 @@ class MainActivity : ComponentActivity() {
                                 onExit = { moveTaskToBack(true) }
                             )
                         }
-                        is ScreenState.DriftCheckpoint -> {
-                            DriftCheckpointScreen(
+                        is ScreenState.DriftCoolOff -> {
+                            DriftCoolOffScreen(
                                 blockedApp = state.targetPackage,
-                                onExtend = { extendSession(state.targetPackage) },
-                                onClose = { endSession(state.targetPackage) }
+                                endTime = state.coolOffEnd,
+                                onExit = { moveTaskToBack(true) }
                             )
+                        }
+                        is ScreenState.DriftCheckpoint -> {
+                            if (state.level >= 2) {
+                                DriftReverificationScreen(
+                                    blockedApp = state.targetPackage,
+                                    onComplete = { clearDriftCheckpoint(state.targetPackage, level = 2) },
+                                    onClose = { endSessionFromCheckpoint(state.targetPackage) }
+                                )
+                            } else {
+                                DriftAnchorScreen(
+                                    blockedApp = state.targetPackage,
+                                    onExtend = { clearDriftCheckpoint(state.targetPackage, level = 1) },
+                                    onClose = { endSessionFromCheckpoint(state.targetPackage) }
+                                )
+                            }
                         }
                         is ScreenState.GateEntry -> {
                             TwoPhaseLockoutScreen(
@@ -143,7 +168,8 @@ class MainActivity : ComponentActivity() {
      * starting the target app. We only charge a surcharge when readingCooldownActive is
      * still true at that moment, which is false by the time the legitimate path runs
      * (launchTarget() flips screenState to Dashboard, which unmounts ReadingPhaseView
-     * and reports cooldown-inactive, before startActivity() is ever called).
+     * and reports cooldown-inactive, before startActivity() is ever called). This is the
+     * ONLY penalty onStop() ever applies — it never touches drift or quarantine state.
      */
     override fun onStop() {
         super.onStop()
@@ -184,8 +210,10 @@ class MainActivity : ComponentActivity() {
         return when {
             mode == MODE_QUARANTINE_HAMMER && target != null ->
                 ScreenState.QuarantineHammer(target, incoming.getLongExtra(EXTRA_QUARANTINE_END, 0L))
+            mode == MODE_DRIFT_COOLOFF && target != null ->
+                ScreenState.DriftCoolOff(target, incoming.getLongExtra(EXTRA_COOLOFF_END, 0L))
             mode == MODE_DRIFT_CHECKPOINT && target != null ->
-                ScreenState.DriftCheckpoint(target)
+                ScreenState.DriftCheckpoint(target, incoming.getIntExtra(EXTRA_DRIFT_LEVEL, 1))
             mode == MODE_GATE_ENTRY && target != null ->
                 ScreenState.GateEntry(target)
             else -> ScreenState.Dashboard
@@ -200,7 +228,7 @@ class MainActivity : ComponentActivity() {
             .putBoolean("session_authorized_$packageName", true)
             .putLong("session_start_$packageName", now)
             .putLong("session_last_active_$packageName", now)
-            .putBoolean("checkpoint_dismissed_$packageName", false)
+            .putInt("drift_level_$packageName", 0)
             .remove("reading_end_time_$packageName")
             .remove("reading_ceiling_ms_$packageName")
             .remove("reading_bypass_count_$packageName")
@@ -208,29 +236,27 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Bug fix: the original code set checkpoint_dismissed_$app = TRUE here, which is
-     * inverted — that flag is what SUPPRESSES the drift checkpoint. Since it was never
-     * cleared anywhere else in the "extend" path, the very first 45-minute checkpoint a
-     * user ever saw would permanently disable all future ones for that trust chain
-     * (session_start already resets continuousDuration to ~0 on extend, so there was
-     * never a need to also suppress the flag — that's what caused the feature to fire
-     * once and then silently stop working).
+     * Clears one Progressive Drift Escalation checkpoint (level 1 or 2) and sends the
+     * user back to the target app. Deliberately does NOT touch session_start — resetting
+     * it here was the old bug that let a user dismiss the same checkpoint forever for
+     * unlimited continuous access. drift_level is the only thing that advances; the
+     * continuous-duration clock the service reads keeps climbing from the original
+     * session start, which is exactly what makes checkpoint 2 (90 min) and checkpoint 3
+     * (135 min) real, un-dodgeable escalations rather than a repeatable 45-minute reset.
      */
-    private fun extendSession(packageName: String) {
-        val now = System.currentTimeMillis()
+    private fun clearDriftCheckpoint(packageName: String, level: Int) {
         prefs().edit()
-            .putLong("session_start_$packageName", now)
-            .putLong("session_last_active_$packageName", now)
-            .putBoolean("checkpoint_dismissed_$packageName", false)
+            .putInt("drift_level_$packageName", level)
+            .putLong("session_last_active_$packageName", System.currentTimeMillis())
             .apply()
         launchTarget(packageName)
     }
 
-    private fun endSession(packageName: String) {
+    private fun endSessionFromCheckpoint(packageName: String) {
         prefs().edit()
             .putBoolean("session_authorized_$packageName", false)
             .remove("session_start_$packageName")
-            .remove("checkpoint_dismissed_$packageName")
+            .putInt("drift_level_$packageName", 0)
             .apply()
         moveTaskToBack(true)
     }
@@ -289,7 +315,7 @@ fun QuarantineScreen(blockedApp: String, endTime: Long, onExit: () -> Unit) {
         )
         Spacer(modifier = Modifier.height(10.dp))
         Text(
-            text = "Target $blockedApp has been hard-locked due to a boundary violation.",
+            text = "Target $blockedApp has been hard-locked due to a boundary violation (explicit content or private-browsing evasion).",
             color = Color(0xFF9CA3AF),
             fontSize = 14.sp
         )
@@ -319,15 +345,104 @@ fun QuarantineScreen(blockedApp: String, endTime: Long, onExit: () -> Unit) {
     }
 }
 
+/**
+ * The 135-minute Progressive Drift Escalation cool-off. Visually and semantically kept
+ * distinct from QuarantineScreen (amber, "cool-off" language) even though the mechanics
+ * are similar — this is a consequence of continuous overuse, not a content violation,
+ * and the two must never be presented as the same thing.
+ */
 @Composable
-fun DriftCheckpointScreen(blockedApp: String, onExtend: () -> Unit, onClose: () -> Unit) {
+fun DriftCoolOffScreen(blockedApp: String, endTime: Long, onExit: () -> Unit) {
+    BackHandler(enabled = true) { onExit() }
+
+    var remainingSeconds by remember(endTime) {
+        val now = System.currentTimeMillis()
+        mutableStateOf(if (endTime > now) (endTime - now) / 1000 else 0L)
+    }
+
+    DisposableEffect(endTime) {
+        val timer = object : CountDownTimer((remainingSeconds * 1000).coerceAtLeast(1_000L), 1000) {
+            override fun onTick(millis: Long) {
+                remainingSeconds = millis / 1000
+            }
+            override fun onFinish() {
+                remainingSeconds = 0
+            }
+        }.start()
+
+        onDispose { timer.cancel() }
+    }
+
+    val minutes = remainingSeconds / 60
+    val seconds = remainingSeconds % 60
+    val formattedTime = String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds)
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(28.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = "DRIFT COOL-OFF ACTIVE",
+            color = Color(0xFFF59E0B),
+            fontSize = 20.sp,
+            fontWeight = FontWeight.Black
+        )
+        Spacer(modifier = Modifier.height(10.dp))
+        Text(
+            text = "Continuous usage in $blockedApp passed 135 minutes without a break. A mandatory 15-minute cool-off is required before your next session.",
+            color = Color(0xFF9CA3AF),
+            fontSize = 14.sp
+        )
+        Spacer(modifier = Modifier.height(36.dp))
+
+        Text(
+            text = formattedTime,
+            fontSize = 48.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = Color.White
+        )
+        Text(
+            text = "Cool-Off Remaining",
+            fontSize = 13.sp,
+            color = Color(0xFF6B7280)
+        )
+        Spacer(modifier = Modifier.height(36.dp))
+
+        Button(
+            onClick = onExit,
+            modifier = Modifier.fillMaxWidth().height(50.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E1E1E)),
+            shape = RoundedCornerShape(8.dp)
+        ) {
+            Text("Acknowledge & Exit to Home", color = Color.White)
+        }
+    }
+}
+
+/**
+ * Shared timed-pause UI used by both Drift Checkpoint 1 (30s, standalone) and the first
+ * half of Drift Checkpoint 2 (60s, followed by a quiz) — same interaction pattern, only
+ * duration/copy/continue-label differ.
+ */
+@Composable
+fun IntentAnchorPause(
+    title: String,
+    message: String,
+    durationSeconds: Long,
+    continueLabel: String,
+    onContinue: () -> Unit,
+    onClose: () -> Unit
+) {
     BackHandler(enabled = true) { onClose() }
 
-    var secondsLeft by remember { mutableStateOf(30L) }
+    var secondsLeft by remember { mutableStateOf(durationSeconds) }
     var timerDone by remember { mutableStateOf(false) }
 
     DisposableEffect(Unit) {
-        val timer = object : CountDownTimer(30_000, 1000) {
+        val timer = object : CountDownTimer(durationSeconds * 1000, 1000) {
             override fun onTick(millis: Long) {
                 secondsLeft = millis / 1000
             }
@@ -348,14 +463,14 @@ fun DriftCheckpointScreen(blockedApp: String, onExtend: () -> Unit, onClose: () 
         verticalArrangement = Arrangement.Center
     ) {
         Text(
-            text = "45-MINUTE DRIFT CHECKPOINT",
+            text = title,
             color = Color(0xFFF59E0B),
             fontSize = 18.sp,
             fontWeight = FontWeight.Bold
         )
         Spacer(modifier = Modifier.height(12.dp))
         Text(
-            text = "You have maintained continuous active usage in $blockedApp for 45 minutes.\n\nTake a mandatory 30-second breath to evaluate: are you executing an intentional objective, or drifting into automated consumption?",
+            text = message,
             color = Color(0xFFD1D5DB),
             fontSize = 14.sp,
             lineHeight = 22.sp
@@ -376,7 +491,7 @@ fun DriftCheckpointScreen(blockedApp: String, onExtend: () -> Unit, onClose: () 
         Spacer(modifier = Modifier.height(32.dp))
 
         Button(
-            onClick = onExtend,
+            onClick = onContinue,
             enabled = timerDone,
             modifier = Modifier.fillMaxWidth().height(50.dp),
             colors = ButtonDefaults.buttonColors(
@@ -386,7 +501,7 @@ fun DriftCheckpointScreen(blockedApp: String, onExtend: () -> Unit, onClose: () 
             shape = RoundedCornerShape(8.dp)
         ) {
             Text(
-                text = if (timerDone) "Continue Task (45-Min Extension)" else "Reflect (${secondsLeft}s)",
+                text = if (timerDone) continueLabel else "Reflect (${secondsLeft}s)",
                 color = if (timerDone) Color.White else Color(0xFF737373)
             )
         }
@@ -399,6 +514,48 @@ fun DriftCheckpointScreen(blockedApp: String, onExtend: () -> Unit, onClose: () 
         ) {
             Text("Task Complete - Close App", color = Color(0xFF9CA3AF))
         }
+    }
+}
+
+/** Drift Checkpoint 1 (45 min continuous): 30-second Intent Anchor, no quiz. */
+@Composable
+fun DriftAnchorScreen(blockedApp: String, onExtend: () -> Unit, onClose: () -> Unit) {
+    IntentAnchorPause(
+        title = "45-MINUTE DRIFT CHECKPOINT",
+        message = "You have maintained continuous active usage in $blockedApp for 45 minutes.\n\nTake a mandatory 30-second breath to evaluate: are you executing an intentional objective, or drifting into automated consumption?",
+        durationSeconds = 30L,
+        continueLabel = "Continue Task",
+        onContinue = onExtend,
+        onClose = onClose
+    )
+}
+
+/**
+ * Drift Checkpoint 2 (90 min continuous): a harder gate than checkpoint 1 — a 60-second
+ * pause followed by a genuine re-verification quiz (reusing the same module bank as
+ * Gate 1) before access continues.
+ */
+@Composable
+fun DriftReverificationScreen(blockedApp: String, onComplete: () -> Unit, onClose: () -> Unit) {
+    val context = LocalContext.current
+    val modules = remember { loadLearningModules(context) }
+    val activeModule = remember(blockedApp) { modules.random() }
+
+    var phase by remember { mutableStateOf(ReverificationPhase.ANCHOR) }
+
+    when (phase) {
+        ReverificationPhase.ANCHOR -> IntentAnchorPause(
+            title = "90-MINUTE RE-VERIFICATION",
+            message = "You've been continuously active in $blockedApp for 90 minutes.\n\nA short pause plus a quick comprehension check is required before continuing.",
+            durationSeconds = 60L,
+            continueLabel = "Start Re-Verification Quiz",
+            onContinue = { phase = ReverificationPhase.QUIZ },
+            onClose = onClose
+        )
+        ReverificationPhase.QUIZ -> QuizPhaseView(
+            module = activeModule,
+            onQuizPassed = onComplete
+        )
     }
 }
 
@@ -531,7 +688,7 @@ fun DashboardScreen() {
                     color = Color.White
                 )
                 Text(
-                    text = "Enforces 3-min entry gate, 10-min idle reset, 45-min drift checks, & 1-hr quarantine on breach.",
+                    text = "Gate 1 entry, 10-min idle reset, 45/90/135-min progressive drift escalation, incognito detection, & 1-hr quarantine on content breach.",
                     fontSize = 13.sp,
                     color = Color(0xFF9CA3AF)
                 )
