@@ -79,6 +79,13 @@ class MainActivity : ComponentActivity() {
     // legitimate backgrounding that happens when we launch the now-authorized target app.
     private var readingCooldownActive by mutableStateOf(false)
 
+    // Bumped on every onResume(). ReadingPhaseView includes this in its remember/
+    // DisposableEffect keys so that coming back to the foreground always re-derives the
+    // countdown from SharedPreferences instead of trusting whatever the already-running
+    // CountDownTimer had in memory — which is what lets a surcharge written in onStop()
+    // (while the composition was never actually torn down) take effect.
+    private var resyncToken by mutableStateOf(0)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         screenState = computeScreenState(intent)
@@ -107,6 +114,7 @@ class MainActivity : ComponentActivity() {
                         is ScreenState.GateEntry -> {
                             TwoPhaseLockoutScreen(
                                 blockedApp = state.targetPackage,
+                                resyncToken = resyncToken,
                                 onReadingCooldownActiveChange = { active -> readingCooldownActive = active },
                                 onComplete = {
                                     startActiveSession(state.targetPackage)
@@ -143,6 +151,11 @@ class MainActivity : ComponentActivity() {
         if (readingCooldownActive && state is ScreenState.GateEntry) {
             recordBypassAttempt(state.targetPackage)
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resyncToken++
     }
 
     private fun recordBypassAttempt(packageName: String) {
@@ -580,6 +593,7 @@ fun DashboardScreen() {
 @Composable
 fun TwoPhaseLockoutScreen(
     blockedApp: String,
+    resyncToken: Int,
     onReadingCooldownActiveChange: (Boolean) -> Unit,
     onComplete: () -> Unit
 ) {
@@ -594,6 +608,7 @@ fun TwoPhaseLockoutScreen(
     when (currentPhase) {
         LockoutPhase.READING -> ReadingPhaseView(
             blockedApp = blockedApp,
+            resyncToken = resyncToken,
             module = activeModule,
             onCooldownActiveChange = onReadingCooldownActiveChange,
             onReadingComplete = { currentPhase = LockoutPhase.QUIZ }
@@ -609,6 +624,7 @@ fun TwoPhaseLockoutScreen(
 @Composable
 fun ReadingPhaseView(
     blockedApp: String,
+    resyncToken: Int,
     module: LearningModule,
     onCooldownActiveChange: (Boolean) -> Unit,
     onReadingComplete: () -> Unit
@@ -620,7 +636,13 @@ fun ReadingPhaseView(
     // time recordBypassAttempt() fires, so a resumed countdown that's legitimately
     // longer than the base 3 minutes (because of a prior bypass) isn't mistaken for
     // stale/tampered data and reset back down to base.
-    var timeLeftSeconds by remember(blockedApp) {
+    //
+    // Keyed on resyncToken (in addition to blockedApp) so that every time the Activity
+    // comes back to the foreground, this block re-runs and re-reads whatever value is
+    // currently in SharedPreferences — including a surcharge that was written while the
+    // composition stayed mounted in the background, which the running CountDownTimer
+    // below has no way of knowing about on its own.
+    var timeLeftSeconds by remember(blockedApp, resyncToken) {
         val now = System.currentTimeMillis()
         val ceilingMs = prefs.getLong("reading_ceiling_ms_$blockedApp", BASE_READING_MS)
         val storedEndTime = prefs.getLong("reading_end_time_$blockedApp", 0L)
@@ -643,14 +665,14 @@ fun ReadingPhaseView(
         mutableStateOf(safeRemainingSeconds)
     }
 
-    val bypassCount = remember(blockedApp) { prefs.getInt("reading_bypass_count_$blockedApp", 0) }
+    val bypassCount = remember(blockedApp, resyncToken) { prefs.getInt("reading_bypass_count_$blockedApp", 0) }
 
-    var isTimerFinished by remember(blockedApp) { mutableStateOf(timeLeftSeconds <= 0) }
+    var isTimerFinished by remember(blockedApp, resyncToken) { mutableStateOf(timeLeftSeconds <= 0) }
 
     // Reports cooldown-active up to MainActivity for the whole time this composable is
     // mounted with an unfinished timer, and flips off the instant the countdown hits
     // zero — a bypass attempt after that point doesn't re-penalize an already-cleared gate.
-    DisposableEffect(blockedApp) {
+    DisposableEffect(blockedApp, resyncToken) {
         onCooldownActiveChange(!isTimerFinished)
         onDispose { onCooldownActiveChange(false) }
     }
@@ -658,7 +680,10 @@ fun ReadingPhaseView(
         if (isTimerFinished) onCooldownActiveChange(false)
     }
 
-    DisposableEffect(blockedApp) {
+    // Also keyed on resyncToken: on every return-to-foreground we tear down whatever
+    // timer was running (with a possibly-now-stale duration) and start a fresh one from
+    // the just-resynced timeLeftSeconds.
+    DisposableEffect(blockedApp, resyncToken) {
         val timer = object : CountDownTimer((timeLeftSeconds * 1000).coerceAtLeast(1_000L), 1000) {
             override fun onTick(millis: Long) {
                 timeLeftSeconds = millis / 1000
