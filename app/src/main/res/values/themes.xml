@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        Deliberately parented on a platform (android:) theme rather than
+        Theme.Material3.DayNight.NoActionBar or Theme.AppCompat.DayNight.NoActionBar.
+        Both of those require a library on your classpath (com.google.android.material
+        or androidx.appcompat respectively) that I have no visibility into — your res/
+        directory had nothing in it until this task, which is consistent with a
+        pure-Compose build.gradle that may not pull either in. android:Theme.Material.*
+        ships with every Android SDK, so this parent can't repeat the AAPT
+        "style/resource not found" failure regardless of your dependencies.
+
+        If you already depend on com.google.android.material:material, you can safely
+        swap the parent below to "Theme.Material3.DayNight.NoActionBar" (drop the
+        "android:" prefix on the parent name) to get Material3 dynamic color / component
+        theming for any XML-based views. Everything in this app's actual UI is Compose
+        (MaterialTheme in FocusForgeTheme), so that swap is cosmetic for the system
+        window chrome (status bar / nav bar / cold-start background) only — it won't
+        change how any Compose screen looks either way.
+    -->
+    <style name="Theme.FocusForge" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/focusforge_background</item>
+        <item name="android:statusBarColor">@color/focusforge_background</item>
+        <item name="android:navigationBarColor">@color/focusforge_background</item>
+        <item name="android:colorPrimary">@color/focusforge_primary</item>
+    </style>
+</resources>
