@@ -11,6 +11,18 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import java.util.regex.Pattern
 
+// =====================================================================================
+// DEBUG_ACCELERATED_TIMERS
+// Flip to false before shipping. When true, every user-facing threshold below is scaled
+// down to a testable number of seconds instead of minutes/hours; when false, every
+// threshold uses the exact production millisecond value. Declared as a bare top-level
+// const in this file (not inside the class) so both FocusAccessibilityService.kt and
+// MainActivity.kt can reference it unqualified — they're in the same package
+// (com.focusforge.app), so no import is needed, the same way EXTRA_MODE and friends
+// further down this file are already shared across both files.
+// =====================================================================================
+const val DEBUG_ACCELERATED_TIMERS = true
+
 /**
  * FocusAccessibilityService
  *
@@ -52,18 +64,35 @@ class FocusAccessibilityService : AccessibilityService() {
 
         val DEFAULT_BLOCKED = setOf("com.android.chrome")
 
-        const val SESSION_THROTTLE_MS = 1_500L
-        const val IDLE_TIMEOUT_MS = 10 * 60 * 1000L
+        const val SESSION_THROTTLE_MS = 1_500L // internal polling cadence, not a feature timer — never scaled
+
+        val IDLE_TIMEOUT_MS: Long =
+            if (DEBUG_ACCELERATED_TIMERS) 15_000L else 10 * 60 * 1000L
 
         // Progressive Drift Escalation thresholds — cumulative continuous-usage duration
         // measured from a single, un-reset session_start (see handleSessionState()).
-        const val DRIFT_CHECKPOINT_1_MS = 45 * 60 * 1000L   // 30s Intent Anchor
-        const val DRIFT_CHECKPOINT_2_MS = 90 * 60 * 1000L   // 60s pause + re-verification quiz
-        const val DRIFT_CHECKPOINT_3_MS = 135 * 60 * 1000L  // mandatory cool-off
-        const val DRIFT_COOLOFF_DURATION_MS = 15 * 60 * 1000L
+        // Note: these are `val`, not `const val` — a const val's initializer must be a
+        // compile-time-constant literal, and Kotlin doesn't reliably treat an `if`
+        // branching on another const as one across versions, so `val` is the safe form
+        // here even though the value is still fixed at process start.
+        val DRIFT_CHECKPOINT_1_MS: Long =                     // 30s Intent Anchor
+            if (DEBUG_ACCELERATED_TIMERS) 30_000L else 45 * 60 * 1000L
+        val DRIFT_CHECKPOINT_2_MS: Long =                     // 60s pause + re-verification quiz
+            if (DEBUG_ACCELERATED_TIMERS) 60_000L else 90 * 60 * 1000L
+        val DRIFT_CHECKPOINT_3_MS: Long =                     // mandatory cool-off
+            if (DEBUG_ACCELERATED_TIMERS) 90_000L else 135 * 60 * 1000L
+        val DRIFT_COOLOFF_DURATION_MS: Long =
+            if (DEBUG_ACCELERATED_TIMERS) 20_000L else 15 * 60 * 1000L
 
-        const val QUARANTINE_FIRST_BREACH_MS = 1 * 60 * 60 * 1000L
-        const val QUARANTINE_REPEAT_BREACH_MS = 4 * 60 * 60 * 1000L
+        val QUARANTINE_FIRST_BREACH_MS: Long =
+            if (DEBUG_ACCELERATED_TIMERS) 60_000L else 1 * 60 * 60 * 1000L
+        val QUARANTINE_REPEAT_BREACH_MS: Long =
+            if (DEBUG_ACCELERATED_TIMERS) 120_000L else 4 * 60 * 60 * 1000L
+
+        // NOT scaled by design: this is the window that decides whether a second breach
+        // counts as a "repeat" for escalation purposes. Testing 1hr→4hr escalation just
+        // means breaching twice in quick succession — both breaches naturally fall
+        // inside any 24-hour window, debug or not, so there's nothing to shrink here.
         const val REPEAT_BREACH_WINDOW_MS = 24 * 60 * 60 * 1000L
 
         // Bounds for the ONE tree walk we still do (on window-state / navigation changes).
