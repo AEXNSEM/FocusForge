@@ -33,10 +33,23 @@ private const val PREFS_NAME = "focus_forge_prefs"
 // Gate 1 reading cooldown + Home-Bypass Surcharge tuning. This track is completely
 // separate from Progressive Drift Escalation and from the Trapwire Quarantine Hammer —
 // it only ever adds minutes to the Gate 1 reading countdown, never triggers a lock.
-private const val BASE_READING_MS = 180_000L          // 3-minute mandatory reset
-private const val BYPASS_SURCHARGE_FIRST_MS = 5 * 60_000L   // +5 min on the 1st bypass
-private const val BYPASS_SURCHARGE_REPEAT_MS = 10 * 60_000L // +10 min on each bypass after that
-private const val MAX_COUNTED_BYPASS_ATTEMPTS = 3      // worst case: 3 + 5 + 10 + 10 = 28 min
+// DEBUG_ACCELERATED_TIMERS is declared once, at the top of FocusAccessibilityService.kt,
+// and referenced here unqualified since both files share the com.focusforge.app package.
+private val BASE_READING_MS: Long =                    // 3-minute mandatory reset
+    if (DEBUG_ACCELERATED_TIMERS) 15_000L else 180_000L
+
+// Not in the original debug-scaling list, but added deliberately: leaving these at real
+// 5/10-minute penalties next to a 15-second debug reading timer would make the
+// Home-Bypass Surcharge itself impossible to observe in a debug session (you'd add a
+// real-world 5 minutes onto a 15-second timer and never see the countdown reflect it
+// before the test window ends). Scaled proportionally; adjust freely if you want
+// different debug values here.
+private val BYPASS_SURCHARGE_FIRST_MS: Long =           // +5 min prod / +10s debug
+    if (DEBUG_ACCELERATED_TIMERS) 10_000L else 5 * 60_000L
+private val BYPASS_SURCHARGE_REPEAT_MS: Long =          // +10 min prod / +20s debug
+    if (DEBUG_ACCELERATED_TIMERS) 20_000L else 10 * 60_000L
+
+private const val MAX_COUNTED_BYPASS_ATTEMPTS = 3      // a count, not a duration — never scaled
 
 data class LearningModule(
     val id: String,
