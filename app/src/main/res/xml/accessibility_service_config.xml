@@ -1,1 +1,16 @@
-<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android" android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewTextChanged|typeViewTextSelectionChanged" android:accessibilityFeedbackType="feedbackGeneric" android:notificationTimeout="120" android:canRetrieveWindowContent="true" android:accessibilityFlags="flagDefault"/>
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     typeViewClicked / typeViewFocused: added for Task B's click/focus incognito trap —
+     catches a tap on Chrome's "New Incognito Tab" menu item at the moment it happens,
+     rather than waiting for a later window-state-changed sweep that may arrive too late
+     (see the comment above the TYPE_VIEW_CLICKED/TYPE_VIEW_FOCUSED branch in
+     FocusAccessibilityService.detectsBreach() for the exact race this closes).
+     typeNotificationStateChanged: added for Task B's notification sniffer — reads
+     Chrome's persistent "N Incognito tabs" notification text directly.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeViewTextChanged|typeViewTextSelectionChanged|typeViewClicked|typeViewFocused|typeNotificationStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:notificationTimeout="120"
+    android:canRetrieveWindowContent="true"
+    android:accessibilityFlags="flagDefault" />
