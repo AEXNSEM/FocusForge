@@ -23,6 +23,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import org.json.JSONArray
@@ -89,7 +90,7 @@ sealed class ScreenState {
     data class GateEntry(val targetPackage: String) : ScreenState()
     data class DriftCheckpoint(val targetPackage: String, val level: Int) : ScreenState()
     data class DriftCoolOff(val targetPackage: String, val coolOffEnd: Long) : ScreenState()
-    data class QuarantineHammer(val targetPackage: String, val quarantineEnd: Long) : ScreenState()
+    data class QuarantineHammer(val targetPackage: String, val quarantineEnd: Long, val reason: String) : ScreenState()
 }
 
 class MainActivity : ComponentActivity() {
@@ -124,6 +125,7 @@ class MainActivity : ComponentActivity() {
                             QuarantineScreen(
                                 blockedApp = state.targetPackage,
                                 endTime = state.quarantineEnd,
+                                reason = state.reason,
                                 onExit = { moveTaskToBack(true) }
                             )
                         }
@@ -222,7 +224,11 @@ class MainActivity : ComponentActivity() {
         val mode = incoming?.getStringExtra(EXTRA_MODE)
         return when {
             mode == MODE_QUARANTINE_HAMMER && target != null ->
-                ScreenState.QuarantineHammer(target, incoming.getLongExtra(EXTRA_QUARANTINE_END, 0L))
+                ScreenState.QuarantineHammer(
+                    target,
+                    incoming.getLongExtra(EXTRA_QUARANTINE_END, 0L),
+                    incoming.getStringExtra(EXTRA_BREACH_REASON) ?: REASON_EXPLICIT_CONTENT
+                )
             mode == MODE_DRIFT_COOLOFF && target != null ->
                 ScreenState.DriftCoolOff(target, incoming.getLongExtra(EXTRA_COOLOFF_END, 0L))
             mode == MODE_DRIFT_CHECKPOINT && target != null ->
@@ -286,8 +292,33 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+/**
+ * Task C: a high-contrast, unmissable strip stating exactly why the user is looking at
+ * this screen. Used by QuarantineScreen (breach reason) and ReadingPhaseView (bypass
+ * penalty notice) — one component, so the "this is why you're locked out" treatment
+ * stays visually consistent everywhere it's needed.
+ */
 @Composable
-fun QuarantineScreen(blockedApp: String, endTime: Long, onExit: () -> Unit) {
+fun ReasonBanner(text: String, backgroundColor: Color) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(backgroundColor, RoundedCornerShape(8.dp))
+            .padding(vertical = 12.dp, horizontal = 16.dp)
+    ) {
+        Text(
+            text = text,
+            color = Color.White,
+            fontWeight = FontWeight.Black,
+            fontSize = 15.sp,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+@Composable
+fun QuarantineScreen(blockedApp: String, endTime: Long, reason: String, onExit: () -> Unit) {
     BackHandler(enabled = true) { onExit() }
 
     var remainingSeconds by remember(endTime) {
@@ -313,6 +344,12 @@ fun QuarantineScreen(blockedApp: String, endTime: Long, onExit: () -> Unit) {
     val seconds = remainingSeconds % 60
     val formattedTime = String.format(Locale.getDefault(), "%02d:%02d:%02d", hours, minutes, seconds)
 
+    val bannerText = if (reason == REASON_INCOGNITO) {
+        "BREACH: Incognito / Private Tab Attempt"
+    } else {
+        "BREACH: Explicit Content / URL"
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -320,6 +357,8 @@ fun QuarantineScreen(blockedApp: String, endTime: Long, onExit: () -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
+        ReasonBanner(text = bannerText, backgroundColor = Color(0xFFB91C1C))
+        Spacer(modifier = Modifier.height(18.dp))
         Text(
             text = "QUARANTINE LOCK ACTIVE",
             color = Color(0xFFEF4444),
@@ -905,6 +944,11 @@ fun ReadingPhaseView(
             color = Color(0xFF6B7280)
         )
         if (bypassCount > 0) {
+            Spacer(modifier = Modifier.height(10.dp))
+            ReasonBanner(
+                text = "BYPASS PENALTY: Left Reading Screen",
+                backgroundColor = Color(0xFF991B1B)
+            )
             Spacer(modifier = Modifier.height(6.dp))
             Text(
                 text = "Cooldown extended — $bypassCount home-bypass attempt${if (bypassCount == 1) "" else "s"} detected",
