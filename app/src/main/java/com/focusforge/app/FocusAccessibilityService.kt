@@ -36,7 +36,9 @@ const val DEBUG_ACCELERATED_TIMERS = true
  *
  * Two independent, non-interacting penalty tracks are enforced here:
  *  - The Trapwire Quarantine Hammer (this file): explicit-content breach OR incognito/
- *    private-browsing detection → immediate GLOBAL_ACTION_HOME + a 1hr/4hr lock.
+ *    private-browsing detection → an immediate 1hr/4hr lock, enforced by bringing
+ *    MainActivity's quarantine overlay directly to the front (see Task C notes on
+ *    launchQuarantineScreen — no GLOBAL_ACTION_HOME involved).
  *  - Progressive Drift Escalation (this file): pure continuous-usage duration, in three
  *    rising tiers, culminating in a 15-minute cool-off that is deliberately a SEPARATE
  *    mechanism (separate prefs keys, separate screen) from the Quarantine Hammer — an
@@ -55,6 +57,7 @@ class FocusAccessibilityService : AccessibilityService() {
         const val KEY_BLOCKED_SET = "blocked_packages_set"
         const val KEY_QUARANTINE_END_PREFIX = "quarantine_end_"
         const val KEY_LAST_BREACH_PREFIX = "last_breach_timestamp_"
+        const val KEY_LAST_BREACH_REASON_PREFIX = "last_breach_reason_"
         const val KEY_SESSION_AUTHORIZED_PREFIX = "session_authorized_"
         const val KEY_SESSION_START_PREFIX = "session_start_"
         const val KEY_SESSION_LAST_ACTIVE_PREFIX = "session_last_active_"
@@ -100,10 +103,15 @@ class FocusAccessibilityService : AccessibilityService() {
         const val MAX_NODES_PER_SCAN = 400
 
         val INCOGNITO_RESOURCE_ID_MARKERS = listOf(
-            "incognito_toggle_button", "new_incognito_tab", "incognito_badge", "incognito"
+            "incognito_toggle_button", "new_incognito_tab", "incognito_badge",
+            "new_incognito_tab_menu_id", "incognito"
         )
-        val INCOGNITO_DESCRIPTION_MARKERS = listOf(
-            "incognito", "private tab", "private browsing"
+        // Checked against a node's text AND contentDescription (a menu item like
+        // "New Incognito Tab" exposes its label as `text`, not `contentDescription` —
+        // checking only one was the gap that let a menu tap slip through undetected).
+        val INCOGNITO_TEXT_MARKERS = listOf(
+            "incognito", "private tab", "private browsing",
+            "you've gone incognito", "close all incognito tabs", "new incognito tab"
         )
     }
 
@@ -162,7 +170,9 @@ class FocusAccessibilityService : AccessibilityService() {
         for (pkg in blocked) {
             val quarantineEnd = prefs.getLong(KEY_QUARANTINE_END_PREFIX + pkg, 0L)
             if (now < quarantineEnd) {
-                launchQuarantineScreen(pkg, quarantineEnd)
+                val reason = prefs.getString(KEY_LAST_BREACH_REASON_PREFIX + pkg, REASON_EXPLICIT_CONTENT)
+                    ?: REASON_EXPLICIT_CONTENT
+                launchQuarantineScreen(pkg, quarantineEnd, reason)
                 return
             }
         }
@@ -209,19 +219,23 @@ class FocusAccessibilityService : AccessibilityService() {
         val currentTime = System.currentTimeMillis()
 
         // 1. Quarantine gate (content/incognito track). Cheap Long read — unthrottled.
+        // Task C: no GLOBAL_ACTION_HOME here — sending the user home first, then racing
+        // to bring MainActivity to front, was the unreliable part (the home-screen
+        // transition sometimes "won" the race, leaving the user staring at the
+        // launcher instead of the overlay). Launching MainActivity directly with
+        // REORDER_TO_FRONT is both the fix and one less step.
         val quarantineEnd = prefs.getLong(KEY_QUARANTINE_END_PREFIX + packageName, 0L)
         if (currentTime < quarantineEnd) {
-            performGlobalAction(GLOBAL_ACTION_HOME)
-            launchQuarantineScreen(packageName, quarantineEnd)
+            launchQuarantineScreen(packageName, quarantineEnd, REASON_EXPLICIT_CONTENT)
             return
         }
 
-        // 2. Drift cool-off gate (overuse track). Also a cheap Long read, also
-        // unthrottled, and deliberately a SEPARATE key/screen from quarantine above —
-        // these two tracks must never be conflated.
+        // 2. Drift cool-off gate (overuse track). Same reasoning as above — direct
+        // launch, no GLOBAL_ACTION_HOME. Also a cheap Long read, also unthrottled, and
+        // deliberately a SEPARATE key/screen from quarantine above — these two tracks
+        // must never be conflated.
         val coolOffEnd = prefs.getLong(KEY_DRIFT_COOLOFF_END_PREFIX + packageName, 0L)
         if (currentTime < coolOffEnd) {
-            performGlobalAction(GLOBAL_ACTION_HOME)
             launchDriftCoolOffScreen(packageName, coolOffEnd)
             return
         }
@@ -231,17 +245,20 @@ class FocusAccessibilityService : AccessibilityService() {
         // scoped so it stays cheap regardless of event frequency:
         //  - TYPE_VIEW_TEXT_CHANGED / TYPE_VIEW_TEXT_SELECTION_CHANGED: inspect exactly
         //    the node the user is typing into. No traversal at all — O(1).
+        //  - TYPE_VIEW_CLICKED / TYPE_VIEW_FOCUSED: inspect exactly the tapped/focused
+        //    node for an incognito marker. Also O(1).
+        //  - TYPE_NOTIFICATION_STATE_CHANGED: inspect the notification's own text. O(1).
         //  - TYPE_WINDOW_STATE_CHANGED: ONE bounded, editable-plus-incognito-marker
         //    sweep, checking both conditions in the same walk (Task 3's traversal
         //    optimization) rather than scanning the tree twice per navigation.
         //  - Everything else (notably TYPE_WINDOW_CONTENT_CHANGED, which fires on every
         //    scroll/DOM tick): skipped entirely.
+        // This runs completely unconditionally on isAuthorized — an unauthorized/Gate-1
+        // session is inspected exactly the same as an authorized one, so a breach here
+        // is caught before any Gate 1 routing happens, not after.
         val reason = detectsBreach(event)
         if (reason != BreachReason.NONE) {
-            if (reason == BreachReason.INCOGNITO_MODE) {
-                Log.w(TAG, "Incognito/private-browsing indicator detected in $packageName")
-            }
-            triggerQuarantineBreach(packageName, currentTime)
+            triggerQuarantineBreach(packageName, currentTime, reason)
             return
         }
 
@@ -295,7 +312,6 @@ class FocusAccessibilityService : AccessibilityService() {
                     .putInt(KEY_DRIFT_LEVEL_PREFIX + packageName, 0)
                     .putLong(KEY_DRIFT_COOLOFF_END_PREFIX + packageName, coolOffEnd)
                     .commit()
-                performGlobalAction(GLOBAL_ACTION_HOME)
                 launchDriftCoolOffScreen(packageName, coolOffEnd)
                 return
             }
@@ -337,6 +353,41 @@ class FocusAccessibilityService : AccessibilityService() {
                     }
                 } finally {
                     recycleIfNeeded(source)
+                }
+            }
+            // Closes the actual gap that let "type explicit term inside Incognito" slip
+            // through: tapping "New Incognito Tab" from Chrome's overflow menu doesn't
+            // reliably produce a TYPE_WINDOW_STATE_CHANGED event before the next window-
+            // state event routes an unauthorized session to Gate 1 — by the time Chrome's
+            // incognito UI has actually rendered and would show up in a window sweep,
+            // Gate 1 may already have foreground focus, and Chrome (now backgrounded)
+            // stops producing window-state events for us to catch it on. Watching the
+            // click/focus on the menu item itself catches the intent immediately,
+            // before that race window opens. Deliberately scoped to incognito only
+            // (not general explicit-content matching) — a bare click/focus doesn't carry
+            // meaningful typed content the way TYPE_VIEW_TEXT_CHANGED does.
+            AccessibilityEvent.TYPE_VIEW_CLICKED,
+            AccessibilityEvent.TYPE_VIEW_FOCUSED -> {
+                val source = event.source
+                try {
+                    if (source != null && isIncognitoIndicator(source)) {
+                        BreachReason.INCOGNITO_MODE
+                    } else {
+                        BreachReason.NONE
+                    }
+                } finally {
+                    recycleIfNeeded(source)
+                }
+            }
+            // Chrome's persistent "N Incognito tabs — tap to close" notification carries
+            // its text directly on the AccessibilityEvent (no node tree involved), so
+            // this is as cheap as the click/focus path — a plain string check, no walk.
+            AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> {
+                val notificationText = event.text?.joinToString(" ") { it?.toString().orEmpty() }.orEmpty()
+                if (INCOGNITO_TEXT_MARKERS.any { notificationText.contains(it, ignoreCase = true) }) {
+                    BreachReason.INCOGNITO_MODE
+                } else {
+                    BreachReason.NONE
                 }
             }
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
@@ -401,7 +452,10 @@ class FocusAccessibilityService : AccessibilityService() {
         val resId = node.viewIdResourceName ?: ""
         if (INCOGNITO_RESOURCE_ID_MARKERS.any { resId.contains(it, ignoreCase = true) }) return true
         val description = node.contentDescription?.toString().orEmpty()
-        return INCOGNITO_DESCRIPTION_MARKERS.any { description.contains(it, ignoreCase = true) }
+        val text = node.text?.toString().orEmpty()
+        return INCOGNITO_TEXT_MARKERS.any { marker ->
+            description.contains(marker, ignoreCase = true) || text.contains(marker, ignoreCase = true)
+        }
     }
 
     private fun recycleIfNeeded(node: AccessibilityNodeInfo?) {
@@ -421,13 +475,18 @@ class FocusAccessibilityService : AccessibilityService() {
     // Home-Bypass state)
     // =================================================================================
 
-    private fun triggerQuarantineBreach(packageName: String, currentTime: Long) {
+    private fun triggerQuarantineBreach(packageName: String, currentTime: Long, reason: BreachReason) {
+        if (reason == BreachReason.INCOGNITO_MODE) {
+            Log.w(TAG, "Incognito/private-browsing indicator detected in $packageName")
+        }
+
         val prefs = prefs()
         val lastBreachTime = prefs.getLong(KEY_LAST_BREACH_PREFIX + packageName, 0L)
         val isRepeatBreach = (currentTime - lastBreachTime) < REPEAT_BREACH_WINDOW_MS
 
         val penaltyMillis = if (isRepeatBreach) QUARANTINE_REPEAT_BREACH_MS else QUARANTINE_FIRST_BREACH_MS
         val quarantineEnd = currentTime + penaltyMillis
+        val reasonExtra = if (reason == BreachReason.INCOGNITO_MODE) REASON_INCOGNITO else REASON_EXPLICIT_CONTENT
 
         // commit() (synchronous) rather than apply() here deliberately: this is a write
         // that MUST survive an immediate process death — it's rare (at most once per
@@ -435,22 +494,33 @@ class FocusAccessibilityService : AccessibilityService() {
         prefs.edit()
             .putLong(KEY_QUARANTINE_END_PREFIX + packageName, quarantineEnd)
             .putLong(KEY_LAST_BREACH_PREFIX + packageName, currentTime)
+            .putString(KEY_LAST_BREACH_REASON_PREFIX + packageName, reasonExtra)
             .putBoolean(KEY_SESSION_AUTHORIZED_PREFIX + packageName, false)
             .remove(KEY_SESSION_START_PREFIX + packageName)
             .putInt(KEY_DRIFT_LEVEL_PREFIX + packageName, 0)
             .commit()
 
-        performGlobalAction(GLOBAL_ACTION_HOME)
-        launchQuarantineScreen(packageName, quarantineEnd)
+        // Task C: no GLOBAL_ACTION_HOME — direct launch is the reliable path.
+        launchQuarantineScreen(packageName, quarantineEnd, reasonExtra)
     }
 
     // =================================================================================
-    // Screen launches
+    // Screen launches — Task C: FLAG_ACTIVITY_REORDER_TO_FRONT instead of SINGLE_TOP.
+    // MainActivity already declares android:launchMode="singleTop" in the manifest, so
+    // dropping the Intent-level SINGLE_TOP flag changes nothing about onNewIntent()
+    // delivery (that's driven by the manifest launch mode, not this flag) — adding
+    // REORDER_TO_FRONT is what actually helps here, ensuring the activity is brought to
+    // the front of its task instead of relying on a preceding GLOBAL_ACTION_HOME to
+    // clear the way (removed — see onAccessibilityEvent / triggerQuarantineBreach /
+    // handleSessionState). This relies on the same startActivity-from-a-bound-
+    // accessibility-service exemption every one of these calls already depended on
+    // before this change — nothing new is being asked of the OS here, only the extra
+    // HOME step is gone.
     // =================================================================================
 
     private fun launchLockoutScreen(packageName: String) {
         startActivity(Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
             putExtra(EXTRA_MODE, MODE_GATE_ENTRY)
             putExtra(EXTRA_TRIGGERED_BY, packageName)
         })
@@ -458,7 +528,7 @@ class FocusAccessibilityService : AccessibilityService() {
 
     private fun launchDriftCheckpointScreen(packageName: String, level: Int) {
         startActivity(Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
             putExtra(EXTRA_MODE, MODE_DRIFT_CHECKPOINT)
             putExtra(EXTRA_TRIGGERED_BY, packageName)
             putExtra(EXTRA_DRIFT_LEVEL, level)
@@ -467,19 +537,20 @@ class FocusAccessibilityService : AccessibilityService() {
 
     private fun launchDriftCoolOffScreen(packageName: String, coolOffEnd: Long) {
         startActivity(Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
             putExtra(EXTRA_MODE, MODE_DRIFT_COOLOFF)
             putExtra(EXTRA_TRIGGERED_BY, packageName)
             putExtra(EXTRA_COOLOFF_END, coolOffEnd)
         })
     }
 
-    private fun launchQuarantineScreen(packageName: String, quarantineEnd: Long) {
+    private fun launchQuarantineScreen(packageName: String, quarantineEnd: Long, reason: String) {
         startActivity(Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
             putExtra(EXTRA_MODE, MODE_QUARANTINE_HAMMER)
             putExtra(EXTRA_TRIGGERED_BY, packageName)
             putExtra(EXTRA_QUARANTINE_END, quarantineEnd)
+            putExtra(EXTRA_BREACH_REASON, reason)
         })
     }
 
@@ -495,8 +566,11 @@ const val EXTRA_TRIGGERED_BY = "TRIGGERED_BY"
 const val EXTRA_QUARANTINE_END = "QUARANTINE_END"
 const val EXTRA_DRIFT_LEVEL = "DRIFT_LEVEL"
 const val EXTRA_COOLOFF_END = "COOLOFF_END"
+const val EXTRA_BREACH_REASON = "BREACH_REASON"
 const val MODE_GATE_ENTRY = "GATE_ENTRY"
 const val MODE_DRIFT_CHECKPOINT = "DRIFT_CHECKPOINT"
 const val MODE_DRIFT_COOLOFF = "DRIFT_COOLOFF"
 const val MODE_QUARANTINE_HAMMER = "QUARANTINE_HAMMER"
 const val MODE_DASHBOARD = "DASHBOARD"
+const val REASON_EXPLICIT_CONTENT = "EXPLICIT_CONTENT"
+const val REASON_INCOGNITO = "INCOGNITO_MODE"
